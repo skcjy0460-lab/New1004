@@ -1,0 +1,7 @@
+streamlit>=1.40
+requests>=2.31
+beautifulsoup4>=4.12
+trafilatura>=1.12
+googlenewsdecoder>=0.1.7
+google-genai>=1.0
+python-dateutil>=2.9
