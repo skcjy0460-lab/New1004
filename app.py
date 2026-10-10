@@ -16,10 +16,12 @@ import base64
 import difflib
 import hmac
 import html
+import io
 import json
 import re
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -107,7 +109,10 @@ class Article:
     body: str = ""
     coverage: int = 1
     summary: str = ""
-    key_facts: list[str] = field(default_factory=list)
+    detail: list[str] = field(default_factory=list)
+    key_points: list[dict] = field(default_factory=list)
+    numbers: list[dict] = field(default_factory=list)
+    quotes: list[str] = field(default_factory=list)
     importance: int = 5
     subtopic: str = ""
     article_type: str = ""
@@ -607,13 +612,15 @@ class GeminiRunner:
         raise RuntimeError(f"모든 모델 호출 실패: {last}")
 
 
-ARTICLE_SYSTEM = """당신은 한국 언론 기사를 '사실 중심'으로 요약하는 편집 보조자입니다.
+ARTICLE_SYSTEM = """당신은 한국 언론 기사를 '사실 중심'으로 정리하는 편집 보조자입니다.
 규칙:
 - 제공된 [본문]에 적힌 내용만 사용합니다. 외부 지식·추측·평가·과장 표현을 추가하지 않습니다.
 - 숫자, 고유명사, 날짜, 직함은 본문 그대로 옮깁니다. 본문에 없으면 쓰지 않습니다.
 - 기사 유형을 판정합니다: "사실보도" | "전망·추측" | "칼럼·사설" | "광고성".
   · 확인되지 않은 소문, 익명 관계자 발 관측, '~할 듯/~전망/~가능성' 중심의 기사는 "전망·추측".
   · 공식 발표, 확정된 사건, 공시, 경기 결과, 정부 발표, 수치 발표 등은 "사실보도".
+- detail은 기사 내용을 순서대로 빠짐없이 '자신의 문장으로 다시 쓴' 정리입니다. 본문 문장을 그대로 복사하지 않습니다.
+- quotes는 본문에 글자 그대로 존재하는 문장만 넣습니다(한 글자도 바꾸지 않음). 없으면 빈 배열.
 - 반드시 JSON 객체 하나만 출력합니다."""
 
 
@@ -625,18 +632,52 @@ def summarize_article(runner: GeminiRunner, a: Article) -> dict:
 발행: {a.published:%Y-%m-%d %H:%M}
 
 [본문]
-{a.body[:7000]}
+{a.body[:9000]}
 
 [출력 JSON 스키마]
 {{
   "article_type": "사실보도|전망·추측|칼럼·사설|광고성",
   "type_reason": "유형 판정 근거 한 문장",
-  "summary": "본문 근거 사실 요약 2~3문장 (해요체 금지, '~했다/~밝혔다' 보도체)",
-  "key_facts": ["핵심 사실 2~4개, 각 60자 이내"],
+  "summary": "핵심 요약 3~4문장 (보도체 '~했다/~밝혔다')",
+  "detail": ["기사 내용을 순서대로 재구성한 문단 3~4개, 전체 600~900자"],
+  "key_points": [{{"point": "중점 소제목 15자 내외", "desc": "근거 사실 1문장"}}],   // 3~4개
+  "numbers": [{{"label": "지표명", "value": "수치(단위 포함, 본문 표기 그대로)", "note": "부연 15자 이내"}}],   // 0~3개, 본문에 명시된 수치만
+  "quotes": ["본문 그대로의 인용 문장 (각 100자 이내)"],   // 0~2개
   "importance": 1~10 정수 (사회적 파급력·공공성 기준),
   "subtopic": "소분류 2~8자"
 }}"""
     return runner.generate_json(prompt, ARTICLE_SYSTEM, runner.light)
+
+
+def fill_article(a: Article, d: dict) -> None:
+    """모델 응답을 검증하며 Article에 반영 (인용문·수치는 원문 대조)."""
+    nb = re.sub(r"\s+", "", a.body)
+    det = d.get("detail", [])
+    if isinstance(det, str):
+        det = [x for x in det.split("\n") if x.strip()]
+    a.detail = [str(x).strip() for x in det if str(x).strip()][:6]
+    kps = []
+    for p in d.get("key_points", [])[:4]:
+        if isinstance(p, dict) and p.get("point"):
+            kps.append({"point": str(p["point"]).strip(), "desc": str(p.get("desc", "")).strip()})
+        elif isinstance(p, str) and p.strip():
+            kps.append({"point": p.strip()[:20], "desc": p.strip()})
+    a.key_points = kps
+    nums = []
+    for n in d.get("numbers", [])[:3]:
+        if not isinstance(n, dict) or not n.get("value") or not n.get("label"):
+            continue
+        tok = re.search(r"\d[\d,\.]*", str(n["value"]))
+        if tok and re.sub(r"\s+", "", tok.group(0)) in nb:  # 본문에 없는 수치는 버림
+            nums.append({"label": str(n["label"]).strip(), "value": str(n["value"]).strip(),
+                         "note": str(n.get("note", "")).strip()})
+    a.numbers = nums
+    qs = []
+    for q in d.get("quotes", [])[:3]:
+        q = str(q).strip().strip('"“”\'')
+        if 8 <= len(q) <= 120 and re.sub(r"\s+", "", q) in nb:  # 원문에 그대로 있는 문장만 인용
+            qs.append(q)
+    a.quotes = qs[:2]
 
 
 BRIEF_SYSTEM = """당신은 뉴스 브리핑 편집자입니다.
@@ -735,7 +776,7 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
                                      "reason": f"{a.article_type or '유형 미상'} 기사 제외: {d.get('type_reason', '')}"})
                     continue
                 a.summary = str(d.get("summary", "")).strip()
-                a.key_facts = [str(x) for x in d.get("key_facts", [])][:4]
+                fill_article(a, d)
                 try:
                     a.importance = max(1, min(10, int(d.get("importance", 5))))
                 except Exception:
@@ -766,7 +807,8 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
             "articles": [{
                 "no": a.no, "title": a.title, "url": a.url, "outlet": a.outlet, "reporter": a.reporter or "미확인",
                 "published": f"{a.published:%Y-%m-%d %H:%M}", "pub_basis": a.pub_basis, "summary": a.summary,
-                "key_facts": a.key_facts, "importance": a.importance, "subtopic": a.subtopic,
+                "detail": a.detail, "key_points": a.key_points, "numbers": a.numbers,
+                "quotes": a.quotes, "importance": a.importance, "subtopic": a.subtopic,
                 "coverage": a.coverage,
             } for a in chosen],
         })
@@ -796,97 +838,136 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5) HTML A4 보고서 렌더링
+# 5) HTML A4 보고서 렌더링 (원무일일보고서 adr-a4 디자인 시스템과 통일)
 # ──────────────────────────────────────────────────────────────────────────────
 REPORT_CSS = """
-:root{--ink:#0b2334;--brand:#0f9a8c;--blue:#155EEF;--accent:#d8b879;--mute:#5b6b78;--line:#dde4ea;--soft:#f4f7fa}
-.nr-root{font-family:'Pretendard','Noto Sans KR','Malgun Gothic','Apple SD Gothic Neo',sans-serif;color:var(--ink);
- line-height:1.62;font-size:10.5pt;background:#e9eef3;padding:16px 0;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-.nr-root *{box-sizing:border-box}
-.nr-sheet{width:210mm;min-height:297mm;margin:0 auto 16px;background:#fff;padding:14mm 14mm 12mm;
- box-shadow:0 2px 12px rgba(11,35,52,.15);position:relative}
-.nr-top{display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid var(--ink);padding-bottom:8px;margin-bottom:14px}
-.nr-top img{height:34px;display:block}
-.nr-top .nr-tag{font-size:8pt;letter-spacing:.16em;color:var(--mute);font-weight:700;text-align:right}
-.nr-cover-title{margin:22mm 0 6mm}
-.nr-eyebrow{color:var(--brand);font-weight:800;font-size:9pt;letter-spacing:.18em}
-.nr-h1{font-size:26pt;line-height:1.25;margin:6px 0 8px;font-weight:800;color:var(--ink)}
-.nr-sub{color:var(--mute);font-size:10.5pt}
-.nr-meta{width:100%;border-collapse:collapse;margin:8mm 0;font-size:9.5pt}
-.nr-meta th{width:26%;text-align:left;background:var(--soft);color:var(--mute);font-weight:700;padding:7px 10px;border:1px solid var(--line)}
-.nr-meta td{padding:7px 10px;border:1px solid var(--line)}
-.nr-box{border:1px solid var(--line);border-top:3px solid var(--brand);border-radius:6px;padding:12px 14px;margin:0 0 12px;background:#fff}
-.nr-box h3{margin:0 0 6px;font-size:11pt;color:var(--ink)}
-.nr-box ul{margin:0;padding-left:18px}.nr-box li{margin:3px 0}
-.nr-brief{background:var(--soft);border-left:4px solid var(--accent);border-radius:4px;padding:10px 14px;margin:0 0 12px}
-.nr-brief .nr-bh{font-weight:800;font-size:12pt;margin:0 0 4px}
-.nr-sec{display:flex;align-items:center;gap:10px;margin:0 0 10px;padding-bottom:6px;border-bottom:2px solid var(--ink)}
-.nr-badge{background:var(--ink);color:#fff;border-radius:4px;font-weight:800;font-size:11pt;padding:2px 9px}
-.nr-sec h2{margin:0;font-size:16pt}
-.nr-issue{margin:0 0 6px;font-size:10pt}.nr-issue b{color:var(--blue)}
-.nr-ref{color:var(--brand);font-weight:700;font-size:8.5pt}
-.nr-card{border:1px solid var(--line);border-left:4px solid var(--brand);border-radius:6px;padding:10px 12px;margin:0 0 10px;
- break-inside:avoid;page-break-inside:avoid;background:#fff}
-.nr-card .nr-no{display:inline-block;background:var(--brand);color:#fff;font-size:8pt;font-weight:800;border-radius:3px;padding:0 6px;margin-right:6px;vertical-align:2px}
-.nr-card h4{margin:0 0 4px;font-size:11pt;line-height:1.4}
-.nr-card h4 a{color:var(--ink);text-decoration:none}
-.nr-row{font-size:8.5pt;color:var(--mute);margin:0 0 6px}.nr-row b{color:var(--ink)}
-.nr-sum{margin:0 0 6px;font-size:10pt}
-.nr-facts{margin:0 0 6px;padding-left:16px;font-size:9.5pt}.nr-facts li{margin:1px 0}
-.nr-src{font-size:8pt;color:var(--mute);border-top:1px dashed var(--line);padding-top:5px;word-break:break-all}
-.nr-src a{color:var(--blue);text-decoration:none}
-.nr-chip{display:inline-block;border:1px solid var(--line);border-radius:10px;padding:0 7px;margin:0 3px 0 0;font-size:7.5pt;color:var(--mute)}
-.nr-chip.ok{border-color:var(--brand);color:var(--brand)}
-.nr-note{font-size:8.5pt;color:var(--mute);line-height:1.6}
-.nr-foot{margin-top:10px;padding-top:6px;border-top:1px solid var(--line);font-size:7.5pt;color:var(--mute);display:flex;justify-content:space-between}
+@page{size:A4 portrait;margin:8mm 9mm 9mm}
+*{box-sizing:border-box}
+:root{--ink:#0b2334;--muted:#617282;--line:#dce7e8;--wash:#f6f9fa;--brand:#0f9a8c;--brand-dark:#08766d;--brand-soft:#e7f5f3;--accent:#d8b879;--blue:#155EEF}
+html,body{margin:0}
+.adr-a4-body{margin:0;background:#eef2f3;color:var(--ink);font-family:Pretendard,'Noto Sans KR','Malgun Gothic',Arial,sans-serif;font-size:11.2px;line-height:1.42;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.adr-a4-preview-frame{padding:16px 0 70px}
+.adr-a4-report{width:210mm;max-width:100%;margin:0 auto 18px;background:#fff;color:var(--ink);box-shadow:0 2px 12px rgba(11,35,52,.14)}
+@media screen{.adr-a4-report{min-height:297mm}}
+.adr-a4-head{position:relative;padding:9mm 11mm 6mm;border-bottom:1px solid #e8eeee}
+.adr-a4-head.small{padding:8mm 11mm 4mm}
+.adr-a4-brandline{position:absolute;left:0;right:0;top:0;height:4px;background:linear-gradient(90deg,var(--ink) 0 24%,var(--brand) 24% 82%,var(--accent) 82%)}
+.adr-a4-header-grid{display:grid;grid-template-columns:minmax(0,1fr) 54mm;gap:10mm;align-items:start}
+.adr-a4-header-grid.single{grid-template-columns:1fr}
+.adr-a4-brand{display:flex;align-items:center;gap:9px;margin-bottom:4mm}
+.adr-a4-logo{height:30px;width:auto;display:block}
+.adr-a4-mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(145deg,#0c2c3d,#0f9a8c);flex:none}
+.adr-a4-brandword strong{display:block;font-size:17px;line-height:1;letter-spacing:.02em;font-weight:800;color:var(--ink)}
+.adr-a4-brandword span{display:block;margin-top:3px;font-size:7px;letter-spacing:.10em;color:var(--muted)}
+.adr-a4-eyebrow{display:flex;align-items:center;gap:7px;color:var(--brand-dark);font-size:8.3px;font-weight:800;letter-spacing:.12em;margin-bottom:3px;text-transform:uppercase}
+.adr-a4-eyebrow:before{content:"";width:20px;height:2px;background:var(--brand)}
+.adr-a4-title{margin:0;font-size:22px;word-break:keep-all;line-height:1.2;letter-spacing:-.03em;color:var(--ink)}
+.adr-a4-head.small .adr-a4-title{font-size:19px;line-height:1.3}
+.adr-a4-subtitle{margin:4px 0 0;color:var(--muted);font-size:9.6px}
+.adr-a4-approval{width:54mm;border:1px solid var(--line);border-radius:5px;overflow:hidden;background:#fff;margin-top:9mm}
+.adr-a4-approval-head{text-align:center;background:var(--ink);color:#fff;font-size:7.5px;font-weight:800;padding:3px}
+.adr-a4-approval-grid{display:grid;grid-template-columns:repeat(3,1fr)}
+.adr-a4-approval-grid div{height:15mm;border-right:1px solid var(--line);padding:4px;text-align:center;font-size:8px;color:#657684}
+.adr-a4-approval-grid div:last-child{border-right:0}
+.adr-a4-meta{display:grid;grid-template-columns:1fr 1.2fr 1fr;margin-top:8px;border-top:1px solid var(--ink);border-bottom:1px solid var(--line)}
+.adr-a4-meta.c4{grid-template-columns:1fr 1.1fr .95fr 1.3fr}
+.adr-a4-meta>div{padding:6px 9px 5px 0;min-height:34px}
+.adr-a4-meta>div+div{padding-left:9px;border-left:1px solid var(--line)}
+.adr-a4-meta small{display:block;font-size:7px;letter-spacing:.08em;color:#7a8a95;font-weight:700;margin-bottom:2px}
+.adr-a4-meta b{font-size:9.8px;color:var(--ink)}
+.adr-a4-content{padding:3.5mm 11mm 7mm}
+.adr-a4-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin-bottom:3mm}
+.adr-a4-kpi{border:1px solid var(--line);border-top:2.5px solid var(--brand);padding:7px 8px;border-radius:6px;background:#fff;min-height:52px}
+.adr-a4-kpi small{display:block;color:var(--muted);font-size:7.8px;font-weight:700}
+.adr-a4-kpi b{display:block;font-size:13.2px;margin:2px 0 1px;color:var(--ink);word-break:keep-all}
+.adr-a4-kpi span{font-size:8px;color:#6f7f8c}
+.adr-a4-section{padding:2.5mm 0 1.8mm;border-top:1px solid #edf1f2}
+.adr-a4-block{padding:0 0 1.8mm}
+.adr-a4-stitle{display:flex;align-items:center;gap:7px;margin:0 0 5px;padding-bottom:4px;border-bottom:1px solid #dce8e8;font-size:13px;color:var(--ink)}
+.adr-a4-num{background:var(--ink);color:#fff;border-radius:4px;padding:2px 5px;font-size:8.4px}
+.adr-a4-desc{margin-left:auto;color:#8795a0;font-size:8px;font-weight:500}
+.adr-a4-table{width:100%;border-collapse:collapse;font-size:8.8px}
+.adr-a4-table th,.adr-a4-table td{padding:4px 5px;border-bottom:1px solid #e2eaea;text-align:left;vertical-align:middle}
+.adr-a4-table thead th{background:var(--ink);color:#fff;font-size:8.2px}
+.adr-a4-table tbody tr:nth-child(even){background:#f8fbfb}
+.adr-a4-table td.no{font-weight:800;color:var(--brand-dark);text-align:center}
+.adr-a4-table .m{color:var(--muted);font-size:8px}
+.adr-a4-table .sub{color:#4b5d6b;font-size:8.2px;margin-top:1px}
+.adr-a4-table.kv th{width:22%;background:var(--wash);color:var(--muted);font-size:8.4px;border-right:1px solid #e2eaea}
+.adr-a4-link{color:var(--blue);text-decoration:none;word-break:break-all}
+.adr-a4-link.dark{color:var(--ink);font-weight:700}
+.adr-a4-ai-box{border:1px solid #d9e8e6;border-left:3px solid var(--brand);background:#f7fbfb;border-radius:6px;padding:8px 10px;margin-bottom:1.8mm}
+.adr-a4-ai-box strong{display:block;color:var(--brand-dark);font-size:9px;margin-bottom:3px}
+.adr-a4-ai-box p{margin:0;color:#3e505e;font-size:9.4px;line-height:1.55}
+.adr-a4-ai-box ul{margin:0;padding-left:15px;color:#3e505e;font-size:9px;line-height:1.55}
+.adr-a4-issue{margin:0 0 3px;font-size:9px;color:#3e505e}.adr-a4-issue b{color:var(--blue)}
+.adr-a4-ref{color:var(--brand-dark);font-weight:700;font-size:8px}
+.adr-a4-p{margin:0 0 6px;font-size:10.6px;line-height:1.72;color:#25384a;text-align:justify;word-break:keep-all}
+.adr-a4-special{display:grid;grid-template-columns:62px 1fr;gap:8px;padding:7px 8px;border:1px solid #e5dfcc;border-left:3px solid var(--accent);border-radius:6px;background:#fbfaf5;margin:1mm 0 1.8mm}
+.adr-a4-special b{font-size:8.8px;color:#70581e}
+.adr-a4-special p{margin:0 0 3px;font-size:9.4px;color:#55636e;line-height:1.55}
+.adr-a4-point{display:grid;grid-template-columns:22px 1fr;gap:8px;padding:5px 0;border-bottom:1px solid #edf1f2}
+.adr-a4-point i{font-style:normal;width:20px;height:20px;border-radius:5px;background:var(--brand);color:#fff;font-weight:800;font-size:9px;text-align:center;line-height:20px}
+.adr-a4-point strong{display:block;font-size:10.2px;color:var(--ink)}
+.adr-a4-point p{margin:1px 0 0;font-size:9.4px;color:#4b5d6b;line-height:1.55}
+.adr-a4-chip{display:inline-block;border:1px solid var(--line);border-radius:10px;padding:0 7px;margin:0 3px 2px 0;font-size:7.6px;color:var(--muted)}
+.adr-a4-chip.ok{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+.adr-a4-empty{color:var(--muted);padding:12px;border:1px dashed var(--line);border-radius:6px;text-align:center}
+.adr-a4-footer{display:flex;justify-content:space-between;gap:20px;font-size:7.2px;color:#93a0a8;margin-top:2mm;padding-top:4px;border-top:1px solid #edf1f2}
 .nr-toolbar{position:fixed;right:18px;bottom:18px;display:flex;gap:8px;z-index:9}
-.nr-toolbar button{background:var(--ink);color:#fff;border:0;border-radius:6px;padding:10px 16px;font-weight:700;cursor:pointer;font-family:inherit}
-.nr-toolbar button.nr-b2{background:var(--brand)}
+.nr-toolbar button{background:var(--ink);color:#fff;border:0;border-radius:6px;padding:10px 14px;font-weight:700;cursor:pointer;font-family:inherit;font-size:12px}
+.nr-toolbar button.b2{background:var(--brand)}
 .nr-toolbar button:disabled{opacity:.6;cursor:wait}
-.nr-panel{position:fixed;inset:0;background:rgba(11,35,52,.88);z-index:20;overflow:auto;padding:20px}
-.nr-panel .nr-ph{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#fff;margin:0 auto 14px;max-width:1100px;font-weight:700}
+.nr-panel{position:fixed;inset:0;background:rgba(11,35,52,.9);z-index:20;overflow:auto;padding:20px}
+.nr-panel .nr-ph{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#fff;margin:0 auto 14px;max-width:1100px;font-weight:700;font-size:13px}
 .nr-panel .nr-ph button{background:var(--brand);color:#fff;border:0;border-radius:6px;padding:9px 14px;font-weight:700;cursor:pointer;margin-left:6px;font-family:inherit}
 .nr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;max-width:1100px;margin:0 auto}
 .nr-grid figure{margin:0;background:#fff;border-radius:6px;padding:8px;text-align:center}
 .nr-grid img{width:100%;display:block;border:1px solid var(--line)}
-.nr-grid a{display:inline-block;margin-top:6px;font-size:10pt;color:var(--blue);font-weight:700;text-decoration:none}
-.nr-sec,.nr-brief,.nr-issue,.nr-box,.nr-meta tr,.nr-top{break-inside:avoid;page-break-inside:avoid}
-.nr-sec{break-after:avoid;page-break-after:avoid}
-.nr-empty{color:var(--mute);padding:14px;border:1px dashed var(--line);border-radius:6px;text-align:center}
-.nr-root.nr-blog{background:transparent;padding:0}
-.nr-root.nr-blog .nr-sheet{width:auto;max-width:820px;min-height:0;box-shadow:none;padding:22px;border:1px solid var(--line);margin:0 auto 18px}
-.nr-root.nr-blog .nr-cover-title{margin:10px 0}
-@page{size:A4;margin:13mm 12mm}
+.nr-grid a{display:inline-block;margin-top:6px;font-size:12px;color:var(--blue);font-weight:700;text-decoration:none}
+.adr-a4-body.nr-blog{font-size:13px;background:transparent}
+.adr-a4-body.nr-blog .adr-a4-report{width:auto;max-width:820px;min-height:0;box-shadow:none;border:1px solid var(--line)}
 @media print{
- .nr-root{background:#fff;padding:0}
- .nr-sheet{width:auto;min-height:0;margin:0;padding:0;box-shadow:none;page-break-after:always}
- .nr-sheet:last-child{page-break-after:auto}
- .nr-toolbar,.nr-panel{display:none!important}
+html,body{width:auto!important;min-width:0!important;margin:0!important;padding:0!important;background:#fff!important}
+.adr-a4-body{font-size:10.5px!important;line-height:1.38!important}
+.adr-a4-preview-frame{padding:0!important}
+.adr-a4-report{width:100%!important;max-width:none!important;min-height:0!important;margin:0!important;box-shadow:none!important;border:0!important;break-after:page;page-break-after:always}
+.adr-a4-report:last-of-type{break-after:auto;page-break-after:auto}
+.adr-a4-head{padding:5mm 0 4mm!important;border-bottom:1px solid #e8eeee!important}
+.adr-a4-brandline{top:0!important;height:3px!important}
+.adr-a4-header-grid{grid-template-columns:minmax(0,1fr) 51mm!important;gap:8mm!important}
+.adr-a4-header-grid.single{grid-template-columns:1fr!important}
+.adr-a4-approval{width:51mm!important;margin-top:8mm!important}
+.adr-a4-approval-grid div{height:13mm!important}
+.adr-a4-content{padding:3mm 0 0!important}
+.adr-a4-stitle{break-after:avoid-page!important;page-break-after:avoid!important}
+.adr-a4-kpi,.adr-a4-approval,.adr-a4-ai-box,.adr-a4-special,.adr-a4-point,.adr-a4-table tr,.adr-a4-issue,.adr-a4-p{break-inside:avoid-page!important;page-break-inside:avoid!important}
+.adr-a4-table{break-inside:auto!important}.adr-a4-table thead{display:table-header-group}
+.adr-a4-p{font-size:9.8px!important;line-height:1.6!important;margin-bottom:4px!important}
+.adr-a4-section{padding:1.8mm 0 1.2mm!important}
+.adr-a4-point{padding:3px 0!important}.adr-a4-point p{font-size:9px!important;line-height:1.45!important}
+.adr-a4-kpi{min-height:42px!important;padding:5px 7px!important}
+.adr-a4-ai-box p{font-size:9px!important}
+.nr-toolbar,.nr-panel{display:none!important}
 }
+@media(max-width:800px){.adr-a4-report{width:100%}.adr-a4-head,.adr-a4-content{padding-left:16px;padding-right:16px}.adr-a4-header-grid{grid-template-columns:1fr}.adr-a4-approval{width:100%;margin-top:0}.adr-a4-kpis{grid-template-columns:1fr 1fr}}
 """
 
 
 def logo_b64() -> str:
-    try:
-        return base64.b64encode(LOGO_PATH.read_bytes()).decode()
-    except Exception:
-        return ""
+    for p in (BASE_DIR / "assets" / "wivo_logo_small.png", LOGO_PATH):
+        try:
+            return base64.b64encode(p.read_bytes()).decode()
+        except Exception:
+            continue
+    return ""
 
 
-def _top(logo: str, tag: str) -> str:
-    img = (f'<img alt="Wivo Company" src="data:image/png;base64,{logo}">' if logo
-           else '<b style="font-size:16pt;color:#155EEF">Wivo</b>')
-    return f'<div class="nr-top">{img}<div class="nr-tag">{esc(tag)}</div></div>'
+def toolbar_html(show_art_btn: bool) -> str:
+    art = '<button id="nr-btn-jpg-art" class="b2">기사 페이지만 JPG</button>' if show_art_btn else ""
+    return ('<div class="nr-toolbar"><button onclick="window.print()">인쇄 / PDF</button>'
+            '<button id="nr-btn-jpg" class="b2">JPG 저장</button>' + art + "</div>")
 
-
-def _foot(rep: dict, label: str) -> str:
-    return (f'<div class="nr-foot"><span>Wivo Company · {esc(rep["target_date"])} 뉴스 인텔리전스 리포트</span>'
-            f'<span>{esc(label)}</span></div>')
-
-
-
-TOOLBAR_HTML = """<div class="nr-toolbar"><button id="nr-btn-print" onclick="window.print()">인쇄 / PDF</button>
-<button id="nr-btn-jpg" class="nr-b2">JPG 저장</button></div>"""
 
 EXPORT_JS = r"""
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -894,66 +975,69 @@ EXPORT_JS = r"""
 <script>
 (function(){
   var SCALE=2, Q=0.92, RATIO=297/210, GAP=8;
-  var btn=document.getElementById('nr-btn-jpg');
-  if(!btn) return;
   function toBlob(c){return new Promise(function(res){c.toBlob(res,'image/jpeg',Q);});}
   function dl(blob,name){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
     document.body.appendChild(a);a.click();setTimeout(function(){a.remove();},500);}
-  async function exportJpg(){
+  function setDisabled(v){Array.prototype.forEach.call(document.querySelectorAll('.nr-toolbar button'),function(b){b.disabled=v;});}
+  async function run(btn,onlyArt){
     if(!window.html2canvas){alert('이미지 변환 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.');return;}
-    var label=btn.textContent; btn.disabled=true;
-    var root=document.querySelector('.nr-root');
-    var date=(root.getAttribute('data-date')||'report');
-    var sheets=Array.prototype.slice.call(root.querySelectorAll('.nr-sheet'));
+    var label=btn.textContent; setDisabled(true);
+    var pages=Array.prototype.slice.call(document.querySelectorAll('.adr-a4-report'));
+    if(onlyArt) pages=pages.filter(function(p){return p.getAttribute('data-kind')==='article';});
+    if(!pages.length){alert('변환할 페이지가 없습니다.');setDisabled(false);return;}
+    var date=document.body.getAttribute('data-date')||'report';
     var out=[];
     try{
-      for(var si=0;si<sheets.length;si++){
-        btn.textContent='변환 중 '+(si+1)+'/'+sheets.length;
-        var sh=sheets[si];
+      for(var si=0;si<pages.length;si++){
+        btn.textContent='변환 중 '+(si+1)+'/'+pages.length;
+        var sh=pages[si], tag=sh.getAttribute('data-label')||('p'+(si+1));
         var canvas=await html2canvas(sh,{scale:SCALE,backgroundColor:'#ffffff',useCORS:true,logging:false});
         var sr=sh.getBoundingClientRect(), W=sr.width, k=canvas.width/W;
-        var kids=Array.prototype.slice.call(sh.children);
+        var headEl=sh.querySelector('.adr-a4-head'), cont=sh.querySelector('.adr-a4-content');
+        var kids=cont?Array.prototype.slice.call(cont.children):[];
         var rc=kids.map(function(e){var r=e.getBoundingClientRect();return {t:r.top-sr.top,b:r.bottom-sr.top};});
-        var hi=kids[0].classList.contains('nr-top')?0:-1;
-        var fi=kids[kids.length-1].classList.contains('nr-foot')?kids.length-1:-1;
-        var body=[]; kids.forEach(function(e,i){if(i!==hi&&i!==fi) body.push(i);});
-        var headH=hi>=0?rc[hi].b+GAP:0;
+        var fi=(kids.length&&kids[kids.length-1].classList.contains('adr-a4-footer'))?kids.length-1:-1;
+        var body=[]; kids.forEach(function(e,i){if(i!==fi) body.push(i);});
+        var headH=headEl?(headEl.getBoundingClientRect().bottom-sr.top)+GAP:0;
         var footH=fi>=0?(rc[fi].b-rc[fi].t)+GAP+6:0;
-        var pageH=W*RATIO;
-        var cap=pageH-headH-footH-24;          // 본문이 들어갈 수 있는 높이
+        var pageH=W*RATIO, cap=pageH-headH-footH-24;
         var groups=[], cur=[];
-        body.forEach(function(i){
-          if(cur.length && (rc[i].b-rc[cur[0]].t)>cap){groups.push(cur);cur=[];}
-          cur.push(i);                          // 블록(카드/표/박스)은 절대 중간에서 자르지 않음
-        });
-        if(cur.length) groups.push(cur);
+        var total=body.length?(headH+(rc[body[body.length-1]].b-rc[body[0]].t)+footH+24):0;
+        if(body.length&&total<=pageH*1.2){ groups.push(body.slice()); }   // 약간 넘치는 정도면 한 장을 조금 길게 (분할하지 않음)
+        else{
+          body.forEach(function(i){
+            if(cur.length&&(rc[i].b-rc[cur[0]].t)>cap){groups.push(cur);cur=[];}
+            cur.push(i);                     // 블록(카드/표/박스)은 중간에서 자르지 않음
+          });
+          if(cur.length) groups.push(cur);
+        }
         if(!groups.length) groups.push([]);
-        groups.forEach(function(g){
-          var bodyTop=g.length?rc[g[0]].t:0, bodyH=g.length?rc[g[g.length-1]].b-bodyTop:0;
-          var H=Math.max(pageH, headH+bodyH+footH+24);   // 큰 카드 하나가 넘치면 그 페이지만 길게
+        groups.forEach(function(g,gi){
+          var bt=g.length?rc[g[0]].t:0, bh=g.length?rc[g[g.length-1]].b-bt:0;
+          var H=Math.max(pageH, headH+bh+footH+24);
           var pc=document.createElement('canvas'); pc.width=canvas.width; pc.height=Math.round(H*k);
           var ctx=pc.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,pc.width,pc.height);
-          if(hi>=0) ctx.drawImage(canvas,0,0,canvas.width,headH*k,0,0,canvas.width,headH*k);
-          if(g.length) ctx.drawImage(canvas,0,bodyTop*k,canvas.width,bodyH*k,0,(headH+6)*k,canvas.width,bodyH*k);
+          if(headEl) ctx.drawImage(canvas,0,0,canvas.width,headH*k,0,0,canvas.width,headH*k);
+          if(g.length) ctx.drawImage(canvas,0,bt*k,canvas.width,bh*k,0,(headH+6)*k,canvas.width,bh*k);
           if(fi>=0) ctx.drawImage(canvas,0,rc[fi].t*k,canvas.width,(rc[fi].b-rc[fi].t)*k,0,(H-footH-6)*k,canvas.width,(rc[fi].b-rc[fi].t)*k);
-          out.push(pc);
+          out.push({c:pc,tag:tag+(groups.length>1?'-'+(gi+1):'')});
         });
       }
       btn.textContent='이미지 생성 중…';
       var files=[];
       for(var i=0;i<out.length;i++){
-        var b=await toBlob(out[i]);
-        files.push({blob:b,name:'wivo_news_'+date+'_p'+String(i+1).padStart(2,'0')+'.jpg'});
+        var b=await toBlob(out[i].c);
+        files.push({blob:b,name:'wivo_news_'+date+'_'+String(i+1).padStart(2,'0')+'_'+out[i].tag+'.jpg'});
       }
       showPanel(files,date);
     }catch(e){alert('JPG 변환 중 오류가 발생했습니다: '+e);}
-    btn.disabled=false; btn.textContent=label;
+    setDisabled(false); btn.textContent=label;
   }
   function showPanel(files,date){
     var old=document.querySelector('.nr-panel'); if(old) old.remove();
     var p=document.createElement('div'); p.className='nr-panel';
     var h=document.createElement('div'); h.className='nr-ph';
-    h.innerHTML='<span>JPG '+files.length+'장 생성 완료 · 이미지를 눌러 개별 저장하거나 ZIP으로 한 번에 저장하세요</span>';
+    h.innerHTML='<span>JPG '+files.length+'장 생성 완료 · 개별 저장하거나 ZIP으로 한 번에 저장하세요</span>';
     var box=document.createElement('span');
     if(window.JSZip){var z=document.createElement('button');z.textContent='전체 ZIP 저장';
       z.onclick=async function(){var zip=new JSZip();files.forEach(function(f){zip.file(f.name,f.blob);});
@@ -962,123 +1046,212 @@ EXPORT_JS = r"""
     h.appendChild(box); p.appendChild(h);
     var g=document.createElement('div'); g.className='nr-grid';
     files.forEach(function(f,i){var fg=document.createElement('figure');var u=URL.createObjectURL(f.blob);
-      fg.innerHTML='<img src="'+u+'" alt="page '+(i+1)+'"><a href="'+u+'" download="'+f.name+'">'+(i+1)+'쪽 저장 (JPG)</a>';
+      fg.innerHTML='<img src="'+u+'" alt="page '+(i+1)+'"><a href="'+u+'" download="'+f.name+'">'+(i+1)+'장 저장 (JPG)</a>';
       g.appendChild(fg);});
     p.appendChild(g); document.body.appendChild(p);
   }
-  btn.addEventListener('click',exportJpg);
+  var b1=document.getElementById('nr-btn-jpg'), b2=document.getElementById('nr-btn-jpg-art');
+  if(b1) b1.addEventListener('click',function(){run(b1,false);});
+  if(b2) b2.addEventListener('click',function(){run(b2,true);});
 })();
 </script>
 """
 
-def render_report(rep: dict, mode: str = "print") -> str:
+
+def first_sentence(t: str, n: int = 100) -> str:
+    t = (t or "").strip()
+    m = re.match(r"(.+?(?:다|요)\.)(?:\s|$)", t)
+    s = m.group(1) if m else t
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _brand_html(logo: str) -> str:
+    if logo:
+        return f'<div class="adr-a4-brand"><img class="adr-a4-logo" alt="Wivo Company" src="data:image/png;base64,{logo}"></div>'
+    return ('<div class="adr-a4-brand"><div class="adr-a4-mark"></div><div class="adr-a4-brandword">'
+            '<strong>Wivo</strong><span>CONNECT · WORK · TOGETHER</span></div></div>')
+
+
+def _head(logo: str, eyebrow: str, title: str, subtitle: str, meta: list[tuple[str, str]],
+          approval: bool = False, small: bool = False) -> str:
+    appr = ""
+    if approval:
+        appr = ('<section class="adr-a4-approval"><div class="adr-a4-approval-head">결재</div>'
+                '<div class="adr-a4-approval-grid"><div>작성</div><div>검수</div><div>게시</div></div></section>')
+    sub = f'<p class="adr-a4-subtitle">{esc(subtitle)}</p>' if subtitle else ""
+    metas = "".join(f"<div><small>{esc(k)}</small><b>{esc(v)}</b></div>" for k, v in meta)
+    grid = "adr-a4-header-grid" + ("" if approval else " single")
+    cls = "adr-a4-head" + (" small" if small else "")
+    mc = " c4" if len(meta) == 4 else ""
+    return (f'<header class="{cls}"><div class="adr-a4-brandline"></div>'
+            f'<div class="{grid}"><div>{_brand_html(logo)}<div class="adr-a4-eyebrow">{esc(eyebrow)}</div>'
+            f'<h1 class="adr-a4-title">{esc(title)}</h1>{sub}</div>{appr}</div>'
+            f'<div class="adr-a4-meta{mc}">{metas}</div></header>')
+
+
+def _sec(num: str, title: str, desc: str, inner: str) -> str:
+    d = f'<span class="adr-a4-desc">{esc(desc)}</span>' if desc else ""
+    return (f'<section class="adr-a4-section"><h2 class="adr-a4-stitle"><span class="adr-a4-num">{esc(num)}</span>'
+            f'{esc(title)}{d}</h2>{inner}</section>')
+
+
+def _foot(label: str) -> str:
+    return f'<footer class="adr-a4-footer"><span>Wivo · News Intelligence</span><span>{esc(label)}</span></footer>'
+
+
+def _href(u: str) -> str:
+    return esc(u) if str(u).startswith("http") else "#"
+
+
+def _page(kind: str, label: str, head: str, blocks: list[str]) -> str:
+    return (f'<main class="adr-a4-report" data-kind="{kind}" data-label="{esc(label)}">{head}'
+            f'<div class="adr-a4-content">{"".join(blocks)}</div></main>')
+
+
+def _art_table(arts: list[dict]) -> str:
+    rows = []
+    for a in arts:
+        rep_name = f'{esc(a["reporter"])} 기자' if a["reporter"] != "미확인" else "기자명 미확인"
+        rows.append(
+            f'<tr><td class="no">{a["no"]}</td>'
+            f'<td><a class="adr-a4-link dark" href="{_href(a["url"])}" target="_blank" rel="noopener">{esc(a["title"])}</a>'
+            f'<div class="sub">{esc(first_sentence(a["summary"]))}</div></td>'
+            f'<td>{esc(a["outlet"])}<br><span class="m">{rep_name}</span></td>'
+            f'<td class="m">{esc(a["published"][5:])}</td></tr>')
+    return ('<div class="adr-a4-block"><table class="adr-a4-table"><thead><tr><th style="width:26px">No</th>'
+            '<th>기사 · 한줄 요약</th><th style="width:22%">언론사 · 기자</th><th style="width:70px">발행</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>')
+
+
+def _summary_page(rep: dict, logo: str, date_kr: str) -> str:
+    cats = rep["categories"]
+    arts_all = [a for c in cats for a in c["articles"]]
+    outlets = {a["outlet"] for a in arts_all}
+    raw = sum(v["raw"] for v in rep["stats"].values())
+    ver = sum(v["verified"] for v in rep["stats"].values())
+    models = ", ".join(rep["models"].keys()) or "-"
+    head = _head(logo, "Daily News Intelligence Report", f"{date_kr} 뉴스 인텔리전스 리포트",
+                 "원문 확인된 사실 보도만 선별한 분야별 일일 브리핑 · 요약편",
+                 [("REPORT DATE", rep["target_date"]), ("GENERATED", rep["generated_at"]), ("ANALYSIS", "WIVO AI · " + models.upper()[:38])],
+                 approval=True)
+    kpis = ('<div class="adr-a4-kpis">'
+            f'<div class="adr-a4-kpi"><small>수록 기사</small><b>{len(arts_all)}건</b><span>사실 보도 선별</span></div>'
+            f'<div class="adr-a4-kpi"><small>분야</small><b>{len(cats)}개</b><span>{esc(" · ".join(c["name"] for c in cats))[:30]}</span></div>'
+            f'<div class="adr-a4-kpi"><small>보도 매체</small><b>{len(outlets)}곳</b><span>중복 매체 제외</span></div>'
+            f'<div class="adr-a4-kpi"><small>원문 검증</small><b>{ver}건</b><span>검색 후보 {raw}건 중</span></div></div>')
+    pts = "".join(f"<li>{esc(p)}</li>" for p in rep["executive"]) or "<li>종합 브리핑이 생성되지 않았습니다.</li>"
+    blocks = [kpis,
+              f'<section class="adr-a4-section"><h2 class="adr-a4-stitle"><span class="adr-a4-num">00</span>오늘의 핵심 브리핑'
+              f'<span class="adr-a4-desc">분야별 핵심 요약</span></h2><div class="adr-a4-ai-box"><strong>WIVO AI DAILY BRIEF</strong><ul>{pts}</ul></div></section>']
+    for idx, c in enumerate(cats, 1):
+        b = c["brief"]
+        inner = ""
+        if c["articles"]:
+            if b.get("headline"):
+                inner += (f'<div class="adr-a4-ai-box"><strong>{esc(b["headline"])}</strong><p>{esc(b.get("overview", ""))}</p></div>')
+            for i in b.get("issues", []):
+                refs = " ".join(f"[{n}]" for n in i["article_ids"])
+                inner += (f'<div class="adr-a4-issue"><b>{esc(i["title"])}</b> — {esc(i["detail"])} '
+                          f'<span class="adr-a4-ref">{refs}</span></div>')
+        else:
+            inner = '<div class="adr-a4-empty">조건(발행일·기자명·사실보도)을 모두 충족한 기사가 없습니다.</div>'
+        blocks.append(_sec(f"{idx:02d}", c["name"], f'{len(c["articles"])}건 수록', inner))
+        for k in range(0, len(c["articles"]), 6):  # 표를 6행씩 끊어 JPG/인쇄 시 안전하게 분할
+            blocks.append(_art_table(c["articles"][k:k + 6]))
+    blocks.append(_foot("SUMMARY"))
+    return _page("summary", "summary", head, blocks)
+
+
+def _article_page(rep: dict, logo: str, cat_name: str, a: dict) -> str:
+    reporter = f'{a["reporter"]} 기자' if a["reporter"] != "미확인" else "미확인"
+    sub = f' · {a["subtopic"]}' if a.get("subtopic") else ""
+    head = _head(logo, f"News Article · {cat_name} {a['no']:02d}", a["title"], "",
+                 [("언론사", a["outlet"]), ("기자", reporter), ("발행일시", a["published"]), ("분야", cat_name + sub)], small=True)
+    blocks: list[str] = []
+    nums = a.get("numbers") or []
+    if nums:
+        cells = "".join(f'<div class="adr-a4-kpi"><small>{esc(n["label"])}</small><b>{esc(n["value"])}</b>'
+                        f'<span>{esc(n.get("note", ""))}</span></div>' for n in nums)
+        blocks.append(f'<div class="adr-a4-kpis" style="grid-template-columns:repeat({len(nums)},1fr)">{cells}</div>')
+    paras = a.get("detail") or [a["summary"]]
+    blocks.append(_sec("01", "원문 내용 정리", "기사 본문을 순서대로 재구성 (전문 게재 아님)",
+                       "".join(f'<p class="adr-a4-p">{esc(p)}</p>' for p in paras)))
+    qs = a.get("quotes") or []
+    if qs:
+        who = f'{a["outlet"]}{" · " + a["reporter"] + " 기자" if a["reporter"] != "미확인" else ""}'
+        blocks.append('<div class="adr-a4-special"><b>원문 인용</b><div>'
+                      + "".join(f'<p>“{esc(q)}”</p>' for q in qs)
+                      + f'<p style="color:#8a7a4e;font-size:8px">— {esc(who)}</p></div></div>')
+    blocks.append(_sec("02", "요약 내역", "AI가 원문을 근거로 작성",
+                       f'<div class="adr-a4-ai-box"><strong>KEY SUMMARY</strong><p>{esc(a["summary"])}</p></div>'))
+    kp = a.get("key_points") or []
+    if kp:
+        items = "".join(f'<div class="adr-a4-point"><i>{i}</i><div><strong>{esc(p["point"])}</strong>'
+                        f'<p>{esc(p["desc"])}</p></div></div>' for i, p in enumerate(kp, 1))
+        blocks.append(_sec("03", "중점 부분", "기사에서 꼭 짚어야 할 핵심 사실", items))
+    chips = [f'<span class="adr-a4-chip ok">발행일 검증 · {esc(a["pub_basis"])}</span>', '<span class="adr-a4-chip ok">사실 보도 판정</span>']
+    if a["reporter"] != "미확인":
+        chips.append('<span class="adr-a4-chip ok">기자명 확인</span>')
+    if a["coverage"] > 1:
+        chips.append(f'<span class="adr-a4-chip">{a["coverage"]}개 매체 보도</span>')
+    src = ('<table class="adr-a4-table kv"><tbody>'
+           f'<tr><th>언론사</th><td>{esc(a["outlet"])}</td></tr>'
+           f'<tr><th>기자명</th><td>{esc(reporter)}</td></tr>'
+           f'<tr><th>발행일시</th><td>{esc(a["published"])}</td></tr>'
+           f'<tr><th>원문 주소</th><td><a class="adr-a4-link" href="{_href(a["url"])}" target="_blank" rel="noopener">{esc(a["url"])}</a></td></tr>'
+           f'<tr><th>검증</th><td>{"".join(chips)}</td></tr></tbody></table>')
+    blocks.append(_sec("04", "출처 및 검증", "언론사 · 기자 · 원문 주소", src))
+    blocks.append(_foot(f"{cat_name} · ARTICLE {a['no']:02d}"))
+    return _page("article", f"a{a['no']:02d}", head, blocks)
+
+
+def _notice_page(rep: dict, logo: str) -> str:
+    head = _head(logo, "Method & Notice", "조사 방법 및 유의사항", "",
+                 [("REPORT DATE", rep["target_date"]), ("SOURCES", ", ".join(rep["sources"])),
+                  ("기자명 필수", "ON" if rep["strict_reporter"] else "OFF")], small=True)
+    rows = "".join(f'<tr><td>{esc(k)}</td><td>{v["raw"]}</td><td>{v["verified"]}</td><td><b>{v["final"]}</b></td></tr>'
+                   for k, v in rep["stats"].items())
+    t1 = ('<table class="adr-a4-table"><thead><tr><th>분야</th><th>검색 후보</th><th>원문 검증 통과</th><th>최종 수록</th></tr></thead>'
+          f'<tbody>{rows}</tbody></table>')
+    cnt: dict[str, int] = {}
+    for r in rep["rejected"]:
+        key = re.sub(r"\(.*?\)|:.*$", "", r["reason"]).strip()
+        cnt[key] = cnt.get(key, 0) + 1
+    rr = "".join(f"<tr><td>{esc(k)}</td><td>{v}건</td></tr>" for k, v in sorted(cnt.items(), key=lambda x: -x[1])) or "<tr><td>제외 없음</td><td>-</td></tr>"
+    t2 = f'<table class="adr-a4-table"><thead><tr><th>제외 사유</th><th>건수</th></tr></thead><tbody>{rr}</tbody></table>'
+    notes = ('<div class="adr-a4-ai-box"><strong>유의사항</strong><ul>'
+             '<li>요약·정리문은 AI가 원문 본문을 근거로 작성했으며, 정확한 내용은 반드시 원문 링크에서 확인하시기 바랍니다.</li>'
+             '<li>기사의 저작권은 각 언론사 및 기자에게 있으며, 본 보고서는 기사 전문을 게재하지 않고 재구성한 정리와 출처, 짧은 인용만 제공합니다.</li>'
+             '<li>기자명은 원문 페이지의 메타데이터·바이라인에서 추출한 값입니다.</li>'
+             '<li>추측·전망·소문 위주 기사, 칼럼·사설, 광고성 기사는 AI 판정으로 제외했습니다.</li></ul></div>')
+    blocks = [_sec("01", "분야별 처리 현황", "검색 → 원문 검증 → 최종", t1),
+              _sec("02", "제외 사유 집계", "", t2),
+              _sec("03", "유의사항", "", notes), _foot("NOTICE")]
+    return _page("notice", "notice", head, blocks)
+
+
+def render_report(rep: dict, mode: str = "print", only_no: int | None = None) -> str:
     blog = mode == "blog"
     logo = logo_b64()
     y, m, d = rep["target_date"].split("-")
     date_kr = f"{int(y)}년 {int(m)}월 {int(d)}일 ({rep['weekday']})"
-    cats = [c["name"] for c in rep["categories"]]
-    models = ", ".join(f"{k}×{v}" for k, v in rep["models"].items()) or "-"
-    ref_map = {a["no"]: a for c in rep["categories"] for a in c["articles"]}
-
-    parts: list[str] = []
-    # ── 표지 / 종합
-    exec_html = "".join(f"<li>{esc(p)}</li>" for p in rep["executive"]) or "<li>종합 브리핑이 생성되지 않았습니다.</li>"
-    parts.append(f"""
-<section class="nr-sheet">
- {_top(logo, "DAILY NEWS INTELLIGENCE REPORT")}
- <div class="nr-cover-title">
-  <div class="nr-eyebrow">NEWS INTELLIGENCE REPORT</div>
-  <h1 class="nr-h1">{esc(date_kr)}<br>뉴스 인텔리전스 리포트</h1>
-  <div class="nr-sub">원문 확인된 사실 보도만 선별한 분야별 일일 브리핑</div>
- </div>
- <table class="nr-meta">
-  <tr><th>조사 기준일</th><td>{esc(date_kr)} (KST 00:00–24:00 발행 기사)</td></tr>
-  <tr><th>포함 분야</th><td>{esc(' · '.join(cats))}</td></tr>
-  <tr><th>수록 기사</th><td>총 {rep['total_articles']}건</td></tr>
-  <tr><th>생성 일시</th><td>{esc(rep['generated_at'])}</td></tr>
-  <tr><th>분석 모델</th><td>{esc(models)}</td></tr>
- </table>
- <div class="nr-box"><h3>오늘의 핵심 브리핑</h3><ul>{exec_html}</ul></div>
- <div class="nr-box"><h3>검증 기준</h3>
-  <ul class="nr-note">
-   <li>모든 기사는 원문 페이지에 직접 접속해 <b>발행일 · 본문 · 기자명</b>을 확인했습니다.</li>
-   <li>추측·전망·소문 위주 기사, 칼럼·사설, 광고성 기사는 AI 판정으로 제외했습니다.</li>
-   <li>요약은 원문 본문에 적힌 사실만 사용했으며, 각 기사에 원문 주소·언론사·기자명을 표기했습니다.</li>
-  </ul></div>
- {_foot(rep, "COVER")}
-</section>""")
-
-    # ── 분야별
-    for idx, c in enumerate(rep["categories"], 1):
-        b = c["brief"]
-        if c["articles"]:
-            issues = "".join(
-                f'<div class="nr-issue"><b>{esc(i["title"])}</b> — {esc(i["detail"])} '
-                f'<span class="nr-ref">{" ".join(f"[{n}]" for n in i["article_ids"])}</span></div>'
-                for i in b.get("issues", []))
-            brief = (f'<div class="nr-brief"><div class="nr-bh">{esc(b.get("headline", ""))}</div>'
-                     f'<div>{esc(b.get("overview", ""))}</div></div>') if b.get("headline") else ""
-            cards = []
-            for a in c["articles"]:
-                facts = "".join(f"<li>{esc(f)}</li>" for f in a["key_facts"])
-                facts = f'<ul class="nr-facts">{facts}</ul>' if facts else ""
-                chips = [f'<span class="nr-chip ok">발행일 {esc(a["pub_basis"])}</span>']
-                if a["reporter"] != "미확인":
-                    chips.append('<span class="nr-chip ok">기자명 확인</span>')
-                if a["coverage"] > 1:
-                    chips.append(f'<span class="nr-chip">{a["coverage"]}개 매체 보도</span>')
-                sub = f' · {esc(a["subtopic"])}' if a["subtopic"] else ""
-                href = esc(a["url"]) if a["url"].startswith("http") else "#"
-                cards.append(f"""
- <article class="nr-card">
-  <h4><span class="nr-no">{a['no']}</span><a href="{href}" target="_blank" rel="noopener">{esc(a['title'])}</a></h4>
-  <div class="nr-row"><b>{esc(a['outlet'])}</b> · {esc(a['reporter'])} 기자 · {esc(a['published'])}{sub}</div>
-  <p class="nr-sum">{esc(a['summary'])}</p>{facts}
-  <div class="nr-src">{''.join(chips)}<br>원문: <a href="{href}" target="_blank" rel="noopener">{esc(a['url'])}</a></div>
- </article>""")
-            body = f'{brief}{issues}<div style="height:6px"></div>{"".join(cards)}'
-        else:
-            body = '<div class="nr-empty">조건(발행일·기자명·사실보도)을 모두 충족한 기사가 없습니다.</div>'
-        parts.append(f"""
-<section class="nr-sheet">
- {_top(logo, date_kr)}
- <div class="nr-sec"><span class="nr-badge">{idx:02d}</span><h2>{esc(c['name'])}</h2></div>
- {body}
- {_foot(rep, c['name'])}
-</section>""")
-
-    # ── 방법론 / 고지
-    rej_count: dict[str, int] = {}
-    for r in rep["rejected"]:
-        key = re.sub(r"\(.*?\)|:.*$", "", r["reason"]).strip()
-        rej_count[key] = rej_count.get(key, 0) + 1
-    rej_rows = "".join(f"<tr><th>{esc(k)}</th><td>{v}건</td></tr>" for k, v in sorted(rej_count.items(), key=lambda x: -x[1]))
-    rej_rows = rej_rows or "<tr><th>-</th><td>제외 없음</td></tr>"
-    st_rows = "".join(
-        f"<tr><th>{esc(k)}</th><td>후보 {v['raw']} → 원문 검증 {v['verified']} → 최종 {v['final']}</td></tr>"
-        for k, v in rep["stats"].items())
-    parts.append(f"""
-<section class="nr-sheet">
- {_top(logo, "METHOD & NOTICE")}
- <div class="nr-sec"><span class="nr-badge">i</span><h2>조사 방법 및 유의사항</h2></div>
- <table class="nr-meta">{st_rows}</table>
- <div class="nr-box"><h3>제외 사유 집계</h3><table class="nr-meta" style="margin:0">{rej_rows}</table></div>
- <div class="nr-box"><h3>유의사항</h3>
-  <ul class="nr-note">
-   <li>본 보고서의 요약문은 AI가 원문 본문을 근거로 작성했으며, 정확한 내용은 반드시 원문 링크에서 확인하시기 바랍니다.</li>
-   <li>기사의 저작권은 각 언론사 및 기자에게 있으며, 본 보고서는 기사 전문을 게재하지 않고 요약과 출처만 제공합니다.</li>
-   <li>기자명은 원문 페이지의 메타데이터·바이라인에서 추출한 값입니다.</li>
-   <li>사용 소스: {esc(', '.join(rep['sources']))} / 기자명 필수 모드: {'ON' if rep['strict_reporter'] else 'OFF'}</li>
-  </ul></div>
- {_foot(rep, "NOTICE")}
-</section>""")
-
-    btn = "" if blog else TOOLBAR_HTML + EXPORT_JS
-    cls = "nr-root nr-blog" if blog else "nr-root"
+    pages: list[str] = []
+    if only_no is None:
+        pages.append(_summary_page(rep, logo, date_kr))
+    for c in rep["categories"]:
+        for a in c["articles"]:
+            if only_no is None or a["no"] == only_no:
+                pages.append(_article_page(rep, logo, c["name"], a))
+    if only_no is None:
+        pages.append(_notice_page(rep, logo))
+    tools = "" if blog else toolbar_html(only_no is None) + EXPORT_JS
+    cls = "adr-a4-body nr-blog" if blog else "adr-a4-body"
+    title = f"{date_kr} 뉴스 인텔리전스 리포트 - Wivo"
     return (f'<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<title>{esc(date_kr)} 뉴스 인텔리전스 리포트 - Wivo</title><style>{REPORT_CSS}</style></head>'
-            f'<body style="margin:0"><div class="{cls}" data-date="{esc(rep['target_date'])}">{"".join(parts)}</div>{btn}</body></html>')
+            f'<title>{esc(title)}</title><style>{REPORT_CSS}</style></head>'
+            f'<body class="{cls}" data-date="{esc(rep["target_date"])}"><div class="adr-a4-preview-frame">'
+            f'{"".join(pages)}</div>{tools}</body></html>')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1197,6 +1370,12 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
                 st.session_state["report"] = rep
                 st.session_state["html_print"] = render_report(rep, "print")
                 st.session_state["html_blog"] = render_report(rep, "blog")
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for c in rep["categories"]:
+                        for a in c["articles"]:
+                            zf.writestr(f"article_{a['no']:02d}.html", render_report(rep, "print", only_no=a["no"]))
+                st.session_state["zip_articles"] = buf.getvalue()
                 status.update(label=f"완료 — 총 {rep['total_articles']}건 수록", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="실패", state="error")
@@ -1209,20 +1388,31 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
     fname = f"wivo_news_report_{rep['target_date']}"
     st.divider()
     st.subheader(f"{rep['target_date']} 보고서 — 총 {rep['total_articles']}건")
-    d1, d2, d3 = st.columns(3)
-    d1.download_button("인쇄용 A4 HTML 다운로드", st.session_state["html_print"], f"{fname}_a4.html",
+    d1, d2, d3, d4 = st.columns(4)
+    d1.download_button("전체 A4 HTML", st.session_state["html_print"], f"{fname}_a4.html",
                        "text/html", use_container_width=True, type="primary")
-    d2.download_button("블로그용 HTML 다운로드", st.session_state["html_blog"], f"{fname}_blog.html",
+    d2.download_button("기사별 페이지 ZIP", st.session_state.get("zip_articles", b""), f"{fname}_articles.zip",
+                       "application/zip", use_container_width=True, disabled=not rep["total_articles"])
+    d3.download_button("블로그용 HTML(전체)", st.session_state["html_blog"], f"{fname}_blog.html",
                        "text/html", use_container_width=True)
-    d3.download_button("원본 데이터(JSON)", json.dumps(rep, ensure_ascii=False, indent=2), f"{fname}.json",
+    d4.download_button("원본 데이터(JSON)", json.dumps(rep, ensure_ascii=False, indent=2), f"{fname}.json",
                        "application/json", use_container_width=True)
 
-    st.info("📷 **JPG 저장**: 'A4 미리보기' 탭 우측 하단의 [JPG 저장] 버튼을 누르면 페이지별 JPG가 생성됩니다. "
-            "카드·표가 중간에서 잘리지 않도록 블록 단위로 쪽을 나누며, ZIP으로 한 번에 저장할 수 있습니다. "
-            "(다운로드한 A4 HTML 파일을 브라우저에서 열어도 동일하게 동작합니다 / 인터넷 연결 필요)")
-    t1, t2, t3 = st.tabs(["A4 미리보기", "블로그 미리보기", "검증·제외 내역"])
+    st.info("📷 **JPG 저장**: 'A4 미리보기' 탭 우측 하단의 [JPG 저장](전체) 또는 [기사 페이지만 JPG] 버튼을 누르면 "
+            "페이지별 JPG가 생성됩니다. 기사 1건 = A4 1장이며, 카드·표가 중간에서 잘리지 않도록 블록 단위로 쪽을 나눕니다. "
+            "(다운로드한 HTML 파일을 브라우저에서 열어도 동일하게 동작 / 인터넷 연결 필요)")
+    t1, t_art, t2, t3 = st.tabs(["A4 미리보기", "기사별 블로그 페이지", "블로그 미리보기", "검증·제외 내역"])
     with t1:
         components.html(st.session_state["html_print"], height=1000, scrolling=True)
+    with t_art:
+        opts = {a["no"]: f"[{c['name']}] {a['no']}. {a['title']}" for c in rep["categories"] for a in c["articles"]}
+        if opts:
+            sel = st.selectbox("기사 선택", list(opts.keys()), format_func=lambda n: opts[n])
+            one = render_report(rep, "print", only_no=sel)
+            st.download_button("이 기사 페이지 HTML 다운로드", one, f"{fname}_article{sel:02d}.html", "text/html")
+            components.html(one, height=1150, scrolling=True)
+        else:
+            st.info("수록된 기사가 없습니다.")
     with t2:
         components.html(st.session_state["html_blog"], height=1000, scrolling=True)
     with t3:
