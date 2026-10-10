@@ -311,18 +311,67 @@ def cluster_articles(arts: list[Article], thr: float = 0.62) -> list[list[Articl
 # ──────────────────────────────────────────────────────────────────────────────
 # 2) 원문 접속 · 검증 (발행일 / 기자명 / 본문)
 # ──────────────────────────────────────────────────────────────────────────────
+def _decode_google_builtin(u: str) -> str | None:
+    """googlenewsdecoder 패키지 없이 Google News 링크를 원문 URL로 변환 (내장 디코더)."""
+    gid = urlparse(u).path.rstrip("/").split("/")[-1]
+    if not gid:
+        return None
+    # 구형 포맷: base64 안에 URL이 그대로 들어있음
+    try:
+        raw = base64.urlsafe_b64decode(gid + "=" * (-len(gid) % 4))
+        if raw.startswith(b"\x08\x13\x22") and raw.endswith(b"\xd2\x01\x00"):
+            raw = raw[3:-3]
+            ln = raw[0]
+            raw = raw[2:] if ln >= 0x80 else raw[1:]
+            cand = raw.decode("utf-8", "ignore")
+            if cand.startswith("http") and not cand.startswith("AU_yq"):
+                return cand
+    except Exception:
+        pass
+    # 신형 포맷: batchexecute 호출
+    sig = ts = None
+    for page in (f"https://news.google.com/articles/{gid}", f"https://news.google.com/rss/articles/{gid}"):
+        try:
+            r = requests.get(page, headers=HEADERS, timeout=15)
+            div = BeautifulSoup(r.text, "html.parser").select_one("c-wiz > div[jscontroller]")
+            if div and div.get("data-n-a-sg") and div.get("data-n-a-ts"):
+                sig, ts = div["data-n-a-sg"], div["data-n-a-ts"]
+                break
+        except Exception:
+            continue
+    if not sig:
+        return None
+    inner = ('["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,null,null,null,null,null,0,1],'
+             f'"X","X",1,[1,1,1],1,1,null,0,0,null,0],"{gid}",{ts},"{sig}"]')
+    body = "f.req=" + quote_plus(json.dumps([[["Fbv4je", inner]]]))
+    try:
+        r = requests.post(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            headers={"Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                     "User-Agent": HEADERS["User-Agent"]},
+            data=body, timeout=15)
+        parsed = json.loads(r.text.split("\n\n")[1])[:-2]
+        url = json.loads(parsed[0][2])[1]
+        return url if str(url).startswith("http") else None
+    except Exception:
+        return None
+
+
 def resolve_google_url(u: str) -> str | None:
     if "news.google.com" not in u:
         return u
-    if gnewsdecoder is None:
-        return None
-    for _ in range(2):
+    if gnewsdecoder is not None:
         try:
             res = gnewsdecoder(u, interval=0.2)
             if res.get("status") and res.get("decoded_url"):
                 return res["decoded_url"]
         except Exception:
-            time.sleep(0.8)
+            pass
+    for _ in range(2):
+        out = _decode_google_builtin(u)
+        if out:
+            return out
+        time.sleep(0.8)
     return None
 
 
@@ -1032,9 +1081,6 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
             st.stop()
         if not srcs:
             st.error("검색 소스를 1개 이상 선택하세요.")
-            st.stop()
-        if "Google News" in srcs and gnewsdecoder is None:
-            st.error("googlenewsdecoder 패키지가 필요합니다. requirements.txt를 확인하세요.")
             st.stop()
         cfg = Config(
             target=target, categories=cats, per_cat=per_cat, strict_reporter=strict,
