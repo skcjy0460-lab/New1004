@@ -839,7 +839,19 @@ REPORT_CSS = """
 .nr-chip.ok{border-color:var(--brand);color:var(--brand)}
 .nr-note{font-size:8.5pt;color:var(--mute);line-height:1.6}
 .nr-foot{margin-top:10px;padding-top:6px;border-top:1px solid var(--line);font-size:7.5pt;color:var(--mute);display:flex;justify-content:space-between}
-.nr-print{position:fixed;right:18px;bottom:18px;background:var(--ink);color:#fff;border:0;border-radius:6px;padding:10px 16px;font-weight:700;cursor:pointer;z-index:9}
+.nr-toolbar{position:fixed;right:18px;bottom:18px;display:flex;gap:8px;z-index:9}
+.nr-toolbar button{background:var(--ink);color:#fff;border:0;border-radius:6px;padding:10px 16px;font-weight:700;cursor:pointer;font-family:inherit}
+.nr-toolbar button.nr-b2{background:var(--brand)}
+.nr-toolbar button:disabled{opacity:.6;cursor:wait}
+.nr-panel{position:fixed;inset:0;background:rgba(11,35,52,.88);z-index:20;overflow:auto;padding:20px}
+.nr-panel .nr-ph{display:flex;gap:8px;align-items:center;justify-content:space-between;color:#fff;margin:0 auto 14px;max-width:1100px;font-weight:700}
+.nr-panel .nr-ph button{background:var(--brand);color:#fff;border:0;border-radius:6px;padding:9px 14px;font-weight:700;cursor:pointer;margin-left:6px;font-family:inherit}
+.nr-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;max-width:1100px;margin:0 auto}
+.nr-grid figure{margin:0;background:#fff;border-radius:6px;padding:8px;text-align:center}
+.nr-grid img{width:100%;display:block;border:1px solid var(--line)}
+.nr-grid a{display:inline-block;margin-top:6px;font-size:10pt;color:var(--blue);font-weight:700;text-decoration:none}
+.nr-sec,.nr-brief,.nr-issue,.nr-box,.nr-meta tr,.nr-top{break-inside:avoid;page-break-inside:avoid}
+.nr-sec{break-after:avoid;page-break-after:avoid}
 .nr-empty{color:var(--mute);padding:14px;border:1px dashed var(--line);border-radius:6px;text-align:center}
 .nr-root.nr-blog{background:transparent;padding:0}
 .nr-root.nr-blog .nr-sheet{width:auto;max-width:820px;min-height:0;box-shadow:none;padding:22px;border:1px solid var(--line);margin:0 auto 18px}
@@ -849,7 +861,7 @@ REPORT_CSS = """
  .nr-root{background:#fff;padding:0}
  .nr-sheet{width:auto;min-height:0;margin:0;padding:0;box-shadow:none;page-break-after:always}
  .nr-sheet:last-child{page-break-after:auto}
- .nr-print{display:none!important}
+ .nr-toolbar,.nr-panel{display:none!important}
 }
 """
 
@@ -871,6 +883,93 @@ def _foot(rep: dict, label: str) -> str:
     return (f'<div class="nr-foot"><span>Wivo Company · {esc(rep["target_date"])} 뉴스 인텔리전스 리포트</span>'
             f'<span>{esc(label)}</span></div>')
 
+
+
+TOOLBAR_HTML = """<div class="nr-toolbar"><button id="nr-btn-print" onclick="window.print()">인쇄 / PDF</button>
+<button id="nr-btn-jpg" class="nr-b2">JPG 저장</button></div>"""
+
+EXPORT_JS = r"""
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+(function(){
+  var SCALE=2, Q=0.92, RATIO=297/210, GAP=8;
+  var btn=document.getElementById('nr-btn-jpg');
+  if(!btn) return;
+  function toBlob(c){return new Promise(function(res){c.toBlob(res,'image/jpeg',Q);});}
+  function dl(blob,name){var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+    document.body.appendChild(a);a.click();setTimeout(function(){a.remove();},500);}
+  async function exportJpg(){
+    if(!window.html2canvas){alert('이미지 변환 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.');return;}
+    var label=btn.textContent; btn.disabled=true;
+    var root=document.querySelector('.nr-root');
+    var date=(root.getAttribute('data-date')||'report');
+    var sheets=Array.prototype.slice.call(root.querySelectorAll('.nr-sheet'));
+    var out=[];
+    try{
+      for(var si=0;si<sheets.length;si++){
+        btn.textContent='변환 중 '+(si+1)+'/'+sheets.length;
+        var sh=sheets[si];
+        var canvas=await html2canvas(sh,{scale:SCALE,backgroundColor:'#ffffff',useCORS:true,logging:false});
+        var sr=sh.getBoundingClientRect(), W=sr.width, k=canvas.width/W;
+        var kids=Array.prototype.slice.call(sh.children);
+        var rc=kids.map(function(e){var r=e.getBoundingClientRect();return {t:r.top-sr.top,b:r.bottom-sr.top};});
+        var hi=kids[0].classList.contains('nr-top')?0:-1;
+        var fi=kids[kids.length-1].classList.contains('nr-foot')?kids.length-1:-1;
+        var body=[]; kids.forEach(function(e,i){if(i!==hi&&i!==fi) body.push(i);});
+        var headH=hi>=0?rc[hi].b+GAP:0;
+        var footH=fi>=0?(rc[fi].b-rc[fi].t)+GAP+6:0;
+        var pageH=W*RATIO;
+        var cap=pageH-headH-footH-24;          // 본문이 들어갈 수 있는 높이
+        var groups=[], cur=[];
+        body.forEach(function(i){
+          if(cur.length && (rc[i].b-rc[cur[0]].t)>cap){groups.push(cur);cur=[];}
+          cur.push(i);                          // 블록(카드/표/박스)은 절대 중간에서 자르지 않음
+        });
+        if(cur.length) groups.push(cur);
+        if(!groups.length) groups.push([]);
+        groups.forEach(function(g){
+          var bodyTop=g.length?rc[g[0]].t:0, bodyH=g.length?rc[g[g.length-1]].b-bodyTop:0;
+          var H=Math.max(pageH, headH+bodyH+footH+24);   // 큰 카드 하나가 넘치면 그 페이지만 길게
+          var pc=document.createElement('canvas'); pc.width=canvas.width; pc.height=Math.round(H*k);
+          var ctx=pc.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,pc.width,pc.height);
+          if(hi>=0) ctx.drawImage(canvas,0,0,canvas.width,headH*k,0,0,canvas.width,headH*k);
+          if(g.length) ctx.drawImage(canvas,0,bodyTop*k,canvas.width,bodyH*k,0,(headH+6)*k,canvas.width,bodyH*k);
+          if(fi>=0) ctx.drawImage(canvas,0,rc[fi].t*k,canvas.width,(rc[fi].b-rc[fi].t)*k,0,(H-footH-6)*k,canvas.width,(rc[fi].b-rc[fi].t)*k);
+          out.push(pc);
+        });
+      }
+      btn.textContent='이미지 생성 중…';
+      var files=[];
+      for(var i=0;i<out.length;i++){
+        var b=await toBlob(out[i]);
+        files.push({blob:b,name:'wivo_news_'+date+'_p'+String(i+1).padStart(2,'0')+'.jpg'});
+      }
+      showPanel(files,date);
+    }catch(e){alert('JPG 변환 중 오류가 발생했습니다: '+e);}
+    btn.disabled=false; btn.textContent=label;
+  }
+  function showPanel(files,date){
+    var old=document.querySelector('.nr-panel'); if(old) old.remove();
+    var p=document.createElement('div'); p.className='nr-panel';
+    var h=document.createElement('div'); h.className='nr-ph';
+    h.innerHTML='<span>JPG '+files.length+'장 생성 완료 · 이미지를 눌러 개별 저장하거나 ZIP으로 한 번에 저장하세요</span>';
+    var box=document.createElement('span');
+    if(window.JSZip){var z=document.createElement('button');z.textContent='전체 ZIP 저장';
+      z.onclick=async function(){var zip=new JSZip();files.forEach(function(f){zip.file(f.name,f.blob);});
+        dl(await zip.generateAsync({type:'blob'}),'wivo_news_'+date+'_jpg.zip');};box.appendChild(z);}
+    var c=document.createElement('button');c.textContent='닫기';c.onclick=function(){p.remove();};box.appendChild(c);
+    h.appendChild(box); p.appendChild(h);
+    var g=document.createElement('div'); g.className='nr-grid';
+    files.forEach(function(f,i){var fg=document.createElement('figure');var u=URL.createObjectURL(f.blob);
+      fg.innerHTML='<img src="'+u+'" alt="page '+(i+1)+'"><a href="'+u+'" download="'+f.name+'">'+(i+1)+'쪽 저장 (JPG)</a>';
+      g.appendChild(fg);});
+    p.appendChild(g); document.body.appendChild(p);
+  }
+  btn.addEventListener('click',exportJpg);
+})();
+</script>
+"""
 
 def render_report(rep: dict, mode: str = "print") -> str:
     blog = mode == "blog"
@@ -974,12 +1073,12 @@ def render_report(rep: dict, mode: str = "print") -> str:
  {_foot(rep, "NOTICE")}
 </section>""")
 
-    btn = "" if blog else '<button class="nr-print" onclick="window.print()">인쇄 / PDF 저장</button>'
+    btn = "" if blog else TOOLBAR_HTML + EXPORT_JS
     cls = "nr-root nr-blog" if blog else "nr-root"
     return (f'<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{esc(date_kr)} 뉴스 인텔리전스 리포트 - Wivo</title><style>{REPORT_CSS}</style></head>'
-            f'<body style="margin:0"><div class="{cls}">{"".join(parts)}</div>{btn}</body></html>')
+            f'<body style="margin:0"><div class="{cls}" data-date="{esc(rep['target_date'])}">{"".join(parts)}</div>{btn}</body></html>')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1118,6 +1217,9 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
     d3.download_button("원본 데이터(JSON)", json.dumps(rep, ensure_ascii=False, indent=2), f"{fname}.json",
                        "application/json", use_container_width=True)
 
+    st.info("📷 **JPG 저장**: 'A4 미리보기' 탭 우측 하단의 [JPG 저장] 버튼을 누르면 페이지별 JPG가 생성됩니다. "
+            "카드·표가 중간에서 잘리지 않도록 블록 단위로 쪽을 나누며, ZIP으로 한 번에 저장할 수 있습니다. "
+            "(다운로드한 A4 HTML 파일을 브라우저에서 열어도 동일하게 동작합니다 / 인터넷 연결 필요)")
     t1, t2, t3 = st.tabs(["A4 미리보기", "블로그 미리보기", "검증·제외 내역"])
     with t1:
         components.html(st.session_state["html_print"], height=1000, scrolling=True)
