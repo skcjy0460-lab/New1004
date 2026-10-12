@@ -1478,10 +1478,9 @@ def _summary_page(rep: dict, logo: str, date_kr: str) -> str:
     outlets = {a["outlet"] for a in arts_all}
     raw = sum(v["raw"] for v in rep["stats"].values())
     ver = sum(v["verified"] for v in rep["stats"].values())
-    models = ", ".join(rep["models"].keys()) or "-"
     head = _head(logo, "Daily News Intelligence Report", f"{date_kr} 뉴스 인텔리전스 리포트",
                  "원문 확인된 사실 보도만 선별한 분야별 일일 브리핑 · 요약편",
-                 [("REPORT DATE", rep["target_date"]), ("GENERATED", rep["generated_at"]), ("ANALYSIS", "WIVO AI · " + models.upper()[:38])],
+                 [("REPORT DATE", rep["target_date"]), ("GENERATED", rep["generated_at"]), ("ANALYSIS", "Wivo AI")],
                  approval=True)
     kpis = ('<div class="adr-a4-kpis">'
             f'<div class="adr-a4-kpi"><small>수록 기사</small><b>{len(arts_all)}건</b><span>사실 보도 선별</span></div>'
@@ -1743,7 +1742,7 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
                        "application/zip", use_container_width=True, disabled=not rep["total_articles"])
     d3.download_button("블로그용 HTML(전체)", st.session_state["html_blog"], f"{fname}_blog.html",
                        "text/html", use_container_width=True)
-    d4.download_button("원본 데이터(JSON)", json.dumps(rep, ensure_ascii=False, indent=2), f"{fname}.json",
+    d4.download_button("원본 데이터(JSON)", json.dumps({k: v for k, v in rep.items() if k != "models"}, ensure_ascii=False, indent=2), f"{fname}.json",
                        "application/json", use_container_width=True)
 
     st.info("📷 **JPG 저장**: 'A4 미리보기' 탭 우측 하단의 [JPG 저장](전체) 또는 [기사 페이지만 JPG] 버튼을 누르면 "
