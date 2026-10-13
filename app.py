@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import hmac
 import html
 import io
+import os
 import json
 import re
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -443,6 +446,15 @@ PRESETS: dict[str, list[str]] = {
     "국제": ["국제 뉴스", "미국 중국", "일본 유럽"],
 }
 
+REGIONS: dict[str, list[str]] = {
+    "전국": [], "서울": ["서울"], "경기": ["경기", "경기도"], "인천": ["인천"], "부산": ["부산"], "대구": ["대구"],
+    "광주": ["광주"], "대전": ["대전"], "울산": ["울산"], "세종": ["세종"], "강원": ["강원"],
+    "충북": ["충북", "충청북도"], "충남": ["충남", "충청남도"], "전북": ["전북", "전라북도", "전북특별자치도"],
+    "전남": ["전남", "전라남도"], "경북": ["경북", "경상북도"], "경남": ["경남", "경상남도"], "제주": ["제주"],
+}
+PHRASE_PRESETS = ["병원", "의료기관", "의원", "CT", "MRI", "건강보험", "수가", "전문의", "간호사", "응급실",
+                  "약국", "개원", "폐업", "의료사고", "보건복지부"]
+
 NAME_BLACKLIST = {
     "편집", "뉴스", "디지털", "온라인", "취재", "사진", "영상", "특별", "본사", "자료",
     "데스크", "제보", "연합", "속보", "종합", "인턴", "무단", "저작", "배포", "금지",
@@ -474,6 +486,7 @@ class Article:
     subtopic: str = ""
     article_type: str = ""
     no: int = 0
+    matched: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -496,6 +509,12 @@ class Config:
     naver_id: str = ""
     naver_secret: str = ""
     oversample: int = 3
+    regions: list[list[str]] = field(default_factory=list)   # [[라벨, 별칭...], ...]
+    phrases: list[str] = field(default_factory=list)
+    phrase_mode: str = "or"
+    ex_phrases: list[str] = field(default_factory=list)
+    skip_titles: list[str] = field(default_factory=list)
+    skip_urls: set = field(default_factory=set)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -626,9 +645,75 @@ def fetch_naver_news(keyword: str, target: date, category: str, cid: str, csecre
     return out
 
 
+def norm_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        return p.netloc.lower().replace("www.", "") + p.path.rstrip("/") + (("?" + p.query) if p.query else "")
+    except Exception:
+        return u
+
+
+def _has(text: str, ph: str) -> bool:
+    if re.fullmatch(r"[A-Za-z0-9 .\-]+", ph):  # CT, MRI 같은 영문 약어는 단어 경계로 확인
+        return re.search(r"(?<![A-Za-z0-9])" + re.escape(ph) + r"(?![A-Za-z0-9])", text, re.I) is not None
+    return ph.lower() in text.lower()
+
+
+def build_queries(cat: Category, cfg: Config) -> list[str]:
+    regions = [g[0] for g in cfg.regions] or [""]
+    base = cat.keywords
+    qs: list[str] = []
+    if cfg.phrases:
+        for r in regions:
+            if cfg.phrase_mode == "and" and len(cfg.phrases) > 1:
+                qs.append(f"{r} {' '.join(cfg.phrases)}".strip())
+            for ph in cfg.phrases:
+                qs.append(f"{r} {ph}".strip())
+                for ck in [c for c in base[:2] if ph not in c]:
+                    qs.append(f"{r} {ck} {ph}".strip())
+    else:
+        for r in regions:
+            for ck in base:
+                qs.append(f"{r} {ck}".strip())
+    return list(dict.fromkeys(qs))[: max(len(base), 12)]
+
+
+def apply_filters(a: Article, cfg: Config) -> str | None:
+    """지역/문구/제외문구/중복(임시 저장 기사) 검사. 통과하면 None, 실패하면 사유."""
+    nt = norm_title(a.title)
+    for t in cfg.skip_titles:
+        if difflib.SequenceMatcher(None, nt, t).ratio() >= 0.62:
+            return "임시 저장 기사와 중복"
+    full = a.title + "\n" + a.body
+    for ph in cfg.ex_phrases:
+        if _has(full, ph):
+            return f"제외 문구 포함({ph})"
+    matched: list[str] = []
+    if cfg.regions:
+        hit = None
+        for grp in cfg.regions:
+            for al in grp:
+                if al in a.title or al in a.body[:300] or a.body.count(al) >= 2:
+                    hit = grp[0]
+                    break
+            if hit:
+                break
+        if not hit:
+            return "지역 불일치(" + "/".join(g[0] for g in cfg.regions) + ")"
+        matched.append(f"지역 {hit}")
+    if cfg.phrases:
+        found = [p for p in cfg.phrases if _has(full, p)]
+        ok = len(found) == len(cfg.phrases) if cfg.phrase_mode == "and" else bool(found)
+        if not ok:
+            return "검색 문구 미포함(" + ", ".join(cfg.phrases) + ")"
+        matched += [f"문구 {p}" for p in found]
+    a.matched = matched
+    return None
+
+
 def discover(cat: Category, cfg: Config, log: Callable[[str], None]) -> list[Article]:
     per_query: list[list[Article]] = []
-    for kw in cat.keywords:
+    for kw in build_queries(cat, cfg):
         items: list[Article] = []
         if "google" in cfg.sources:
             try:
@@ -651,6 +736,15 @@ def discover(cat: Category, cfg: Config, log: Callable[[str], None]) -> list[Art
     ex = [e.lower() for e in cfg.exclude if e]
     if ex:
         merged = [a for a in merged if not any(e in (a.outlet or "").lower() or e in a.url.lower() for e in ex)]
+    merged = merged[:250]
+    if cfg.skip_titles:  # 임시 저장 보고서에 이미 있는 기사와 비슷한 제목은 후보에서 제외
+        keep = []
+        for a in merged:
+            nt = norm_title(a.title)
+            if any(difflib.SequenceMatcher(None, nt, t).ratio() >= 0.62 for t in cfg.skip_titles):
+                continue
+            keep.append(a)
+        merged = keep
     return merged
 
 
@@ -859,7 +953,7 @@ def extract_body(content: bytes, soup: BeautifulSoup) -> str:
     return text.strip()
 
 
-def enrich_article(a: Article, target: date, strict: bool) -> str | None:
+def enrich_article(a: Article, target: date, strict: bool, flt: Config | None = None) -> str | None:
     """원문 검증. 통과하면 None, 실패하면 제외 사유(str)를 반환."""
     try:
         url = resolve_google_url(a.url)
@@ -871,6 +965,8 @@ def enrich_article(a: Article, target: date, strict: bool) -> str | None:
     soup = BeautifulSoup(content, "html.parser")
     ld = jsonld_objects(soup)
     a.url = final_url
+    if flt is not None and flt.skip_urls and norm_url(final_url) in flt.skip_urls:
+        return "임시 저장 기사와 중복"
 
     pub = extract_published(soup, ld)
     if pub is not None:
@@ -895,15 +991,19 @@ def enrich_article(a: Article, target: date, strict: bool) -> str | None:
     if og and 8 < len(og[0]) < 160:
         a.title = re.split(r"\s+[|｜]\s+", og[0])[0].strip()
     a.reporter = extract_reporter(soup, ld, body, a.outlet)
+    if flt is not None:
+        why = apply_filters(a, flt)
+        if why:
+            return why
     if strict and not a.reporter:
         return "기자명 미확인"
     return None
 
 
-def enrich_cluster(items: list[Article], target: date, strict: bool):
+def enrich_cluster(items: list[Article], target: date, strict: bool, flt: Config | None = None):
     rejects: list[tuple[Article, str]] = []
     for a in items[:3]:  # 같은 사건의 다른 매체 기사로 대체 시도
-        reason = enrich_article(a, target, strict)
+        reason = enrich_article(a, target, strict, flt)
         if reason is None:
             a.coverage = len({x.outlet for x in items})
             return a, rejects
@@ -1099,7 +1199,7 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
 
         verified: list[Article] = []
         with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = [ex.submit(enrich_cluster, c, cfg.target, cfg.strict_reporter) for c in pool]
+            futs = [ex.submit(enrich_cluster, c, cfg.target, cfg.strict_reporter, cfg) for c in pool]
             for k, f in enumerate(as_completed(futs), 1):
                 try:
                     art, rej = f.result()
@@ -1166,7 +1266,7 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
                 "published": f"{a.published:%Y-%m-%d %H:%M}", "pub_basis": a.pub_basis, "summary": a.summary,
                 "detail": a.detail, "key_points": a.key_points, "numbers": a.numbers,
                 "quotes": a.quotes, "importance": a.importance, "subtopic": a.subtopic,
-                "coverage": a.coverage,
+                "coverage": a.coverage, "matched": a.matched,
             } for a in chosen],
         })
 
@@ -1191,6 +1291,8 @@ def build_report(cfg: Config, log: Callable[[str], None], prog: Callable[[float]
         "stats": stats,
         "rejected": rejected,
         "total_articles": sum(len(c["articles"]) for c in categories_out),
+        "filters": {"regions": [g[0] for g in cfg.regions], "phrases": cfg.phrases, "mode": cfg.phrase_mode,
+                    "exclude": cfg.ex_phrases, "skipped_reports": bool(cfg.skip_titles)},
     }
 
 
@@ -1410,6 +1512,18 @@ EXPORT_JS = r"""
 """
 
 
+def filter_text(rep: dict) -> str:
+    f = rep.get("filters") or {}
+    parts = []
+    if f.get("regions"):
+        parts.append("지역 " + ", ".join(f["regions"]))
+    if f.get("phrases"):
+        parts.append("문구 " + (" + " if f.get("mode") == "and" else " / ").join(f["phrases"]))
+    if f.get("exclude"):
+        parts.append("제외 " + ", ".join(f["exclude"]))
+    return " · ".join(parts)
+
+
 def first_sentence(t: str, n: int = 100) -> str:
     t = (t or "").strip()
     m = re.match(r"(.+?(?:다|요)\.)(?:\s|$)", t)
@@ -1479,7 +1593,7 @@ def _summary_page(rep: dict, logo: str, date_kr: str) -> str:
     raw = sum(v["raw"] for v in rep["stats"].values())
     ver = sum(v["verified"] for v in rep["stats"].values())
     head = _head(logo, "Daily News Intelligence Report", f"{date_kr} 뉴스 인텔리전스 리포트",
-                 "원문 확인된 사실 보도만 선별한 분야별 일일 브리핑 · 요약편",
+                 "원문 확인된 사실 보도만 선별한 분야별 일일 브리핑 · 요약편" + (f" · 검색 조건: {filter_text(rep)}" if filter_text(rep) else ""),
                  [("REPORT DATE", rep["target_date"]), ("GENERATED", rep["generated_at"]), ("ANALYSIS", "Wivo AI")],
                  approval=True)
     kpis = ('<div class="adr-a4-kpis">'
@@ -1542,6 +1656,8 @@ def _article_page(rep: dict, logo: str, cat_name: str, a: dict) -> str:
         chips.append('<span class="adr-a4-chip ok">기자명 확인</span>')
     if a["coverage"] > 1:
         chips.append(f'<span class="adr-a4-chip">{a["coverage"]}개 매체 보도</span>')
+    if a.get("matched"):
+        chips.append(f'<span class="adr-a4-chip ok">검색 조건 · {esc(", ".join(a["matched"]))}</span>')
     src = ('<table class="adr-a4-table kv"><tbody>'
            f'<tr><th>언론사</th><td>{esc(a["outlet"])}</td></tr>'
            f'<tr><th>기자명</th><td>{esc(reporter)}</td></tr>'
@@ -1574,7 +1690,11 @@ def _notice_page(rep: dict, logo: str) -> str:
              '<li>추측·전망·소문 위주 기사, 칼럼·사설, 광고성 기사는 AI 판정으로 제외했습니다.</li></ul></div>')
     blocks = [_sec("01", "분야별 처리 현황", "검색 → 원문 검증 → 최종", t1),
               _sec("02", "제외 사유 집계", "", t2),
-              _sec("03", "유의사항", "", notes), _foot("NOTICE")]
+              ]
+    ft = filter_text(rep)
+    if ft:
+        blocks.append(_sec("03", "검색 조건", "지역 · 기사 내 문구", f'<div class="adr-a4-ai-box"><p>{esc(ft)}</p></div>'))
+    blocks += [_sec("04" if ft else "03", "유의사항", "", notes), _foot("NOTICE")]
     return _page("notice", "notice", head, blocks)
 
 
@@ -1603,7 +1723,259 @@ def render_report(rep: dict, mode: str = "print", only_no: int | None = None) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6) Streamlit UI
+# 7) 임시 저장함 (서버 파일 + JSON 내보내기/불러오기) · 기사 선별 합본
+# ──────────────────────────────────────────────────────────────────────────────
+DRAFT_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
+
+
+def _owner_key() -> str:
+    lic = st.session_state.get("license_key")
+    return hashlib.sha256(lic.encode()).hexdigest()[:12] if lic else "dev"
+
+
+def _draft_dir() -> Path:
+    for base in (BASE_DIR / "drafts", Path(tempfile.gettempdir()) / "wivo_drafts"):
+        try:
+            d = base / _owner_key()  # 라이선스 키별로 저장 공간 분리 (고객 간 노출 방지)
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except Exception:
+            continue
+    raise RuntimeError("임시 저장 폴더를 만들 수 없습니다.")
+
+
+def public_report(rep: dict) -> dict:
+    return {k: v for k, v in rep.items() if k != "models"}
+
+
+def save_draft(rep: dict, name: str) -> str:
+    did = datetime.now(KST).strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
+    payload = {"id": did, "name": name.strip() or f"{rep['target_date']} 보고서",
+               "saved_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "report": rep}
+    (_draft_dir() / f"{did}.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return did
+
+
+def load_draft(did: str) -> dict | None:
+    if not DRAFT_ID_RE.match(did or ""):
+        return None
+    p = _draft_dir() / f"{did}.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def delete_draft(did: str) -> None:
+    if DRAFT_ID_RE.match(did or ""):
+        try:
+            (_draft_dir() / f"{did}.json").unlink()
+        except Exception:
+            pass
+
+
+def list_drafts() -> list[dict]:
+    out = []
+    try:
+        files = sorted(_draft_dir().glob("*.json"), reverse=True)
+    except Exception:
+        return out
+    for p in files:
+        if not DRAFT_ID_RE.match(p.stem):
+            continue
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            r = d["report"]
+            out.append({"id": d["id"], "name": d["name"], "saved_at": d["saved_at"], "date": r["target_date"],
+                        "count": r["total_articles"], "cats": [c["name"] for c in r["categories"]]})
+        except Exception:
+            continue
+    return out
+
+
+def draft_label(d: dict) -> str:
+    return f"{d['name']} · {d['date']} · {d['count']}건 · 저장 {d['saved_at']}"
+
+
+def set_current_report(rep: dict) -> None:
+    st.session_state["report"] = rep
+    st.session_state["html_print"] = render_report(rep, "print")
+    st.session_state["html_blog"] = render_report(rep, "blog")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for c in rep["categories"]:
+            for a in c["articles"]:
+                zf.writestr(f"article_{a['no']:02d}.html", render_report(rep, "print", only_no=a["no"]))
+    st.session_state["zip_articles"] = buf.getvalue()
+
+
+def compose_report(selected: dict[str, list[dict]], sources: list[dict], runner: GeminiRunner,
+                   log: Callable[[str], None]) -> dict:
+    """선별된 기사로 새 보고서를 구성 (번호 재부여 + 분야별/종합 브리핑 재생성)."""
+    base = sources[0]
+    target = date.fromisoformat(base["target_date"])
+    counter, cats_out, briefs = 0, [], {}
+    for name, arts in selected.items():
+        arts = sorted(arts, key=lambda a: -(a.get("importance", 5) + 0.6 * min(a.get("coverage", 1), 5)))
+        items, objs = [], []
+        for a in arts:
+            counter += 1
+            a = dict(a)
+            a["no"] = counter
+            items.append(a)
+            objs.append(Article(category=name, title=a["title"], url=a["url"], outlet=a["outlet"],
+                                summary=a["summary"], no=counter))
+        brief = {"headline": "", "overview": "", "issues": []}
+        if objs:
+            log(f"■ [{name}] 브리핑 재생성")
+            try:
+                brief = category_brief(runner, name, objs)
+            except Exception as e:
+                log(f"  · 브리핑 실패: {e}")
+        if brief["headline"]:
+            briefs[name] = brief
+        cats_out.append({"name": name, "brief": brief, "articles": items})
+    execu: list[str] = []
+    if briefs:
+        try:
+            execu = executive_summary(runner, briefs, target)
+        except Exception as e:
+            log(f"  · 종합 브리핑 실패: {e}")
+    stats: dict[str, dict] = {}
+    for r in sources:
+        for k, v in r["stats"].items():
+            s = stats.setdefault(k, {"raw": 0, "clusters": 0, "verified": 0, "rejected": 0, "final": 0})
+            for f in ("raw", "clusters", "verified", "rejected"):
+                s[f] += v.get(f, 0)
+    for c in cats_out:
+        stats.setdefault(c["name"], {"raw": 0, "clusters": 0, "verified": 0, "rejected": 0, "final": 0})
+        stats[c["name"]]["final"] = len(c["articles"])
+    flt: dict[str, Any] = {"regions": [], "phrases": [], "mode": "or", "exclude": []}
+    for r in sources:
+        f = r.get("filters") or {}
+        for k in ("regions", "phrases", "exclude"):
+            for x in f.get(k, []):
+                if x not in flt[k]:
+                    flt[k].append(x)
+        flt["mode"] = f.get("mode", flt["mode"])
+    return {
+        "target_date": base["target_date"], "weekday": base["weekday"],
+        "generated_at": datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "models": runner.used,
+        "sources": sorted({s for r in sources for s in r["sources"]}),
+        "strict_reporter": any(r["strict_reporter"] for r in sources), "executive": execu,
+        "categories": cats_out, "stats": stats, "rejected": [x for r in sources for x in r["rejected"]][:500],
+        "total_articles": sum(len(c["articles"]) for c in cats_out), "filters": flt,
+    }
+
+
+def drafts_tab(api_key: str, main_model: str, light_model: str) -> None:
+    st.subheader("임시 저장함")
+    st.caption("생성한 보고서를 보관하고, 여러 번 생성한 보고서에서 중복 기사를 빼고 골라 하나의 보고서로 합칠 수 있습니다. "
+               "서버가 재시작되면 보관 내용이 사라질 수 있으니 중요한 보고서는 [JSON 저장]으로 내려받아 두세요.")
+    up = st.file_uploader("저장해 둔 JSON 불러오기", type=["json"], key="draft_upload")
+    if up is not None:
+        sig = f"{up.name}-{up.size}"
+        if st.session_state.get("_last_import") != sig:
+            try:
+                raw = json.loads(up.getvalue().decode("utf-8"))
+                rep = raw.get("report", raw)
+                assert "categories" in rep and "target_date" in rep and "stats" in rep
+                rep.setdefault("models", {})
+                save_draft(rep, raw.get("name") or f"불러옴 {rep['target_date']}")
+                st.session_state["_last_import"] = sig
+                st.success("임시 저장함에 추가했습니다.")
+                st.rerun()
+            except AssertionError:
+                st.error("이 앱에서 내려받은 보고서 JSON이 아닙니다.")
+            except Exception as e:
+                st.error(f"불러오기 실패: {e}")
+
+    drafts = list_drafts()
+    if not drafts:
+        st.info("임시 저장된 보고서가 없습니다. 보고서를 생성하면 자동으로 저장되거나, 생성 후 [임시 저장] 버튼으로 저장할 수 있습니다.")
+        return
+
+    for d in drafts:
+        c1, c2, c3, c4 = st.columns([5, 1.3, 1.3, 1.1])
+        c1.markdown(f"**{d['name']}**  \n{d['date']} · {d['count']}건 · {' / '.join(d['cats'])} · 저장 {d['saved_at']}")
+        if c2.button("불러오기", key=f"ld_{d['id']}", use_container_width=True):
+            full = load_draft(d["id"])
+            if full:
+                full["report"].setdefault("models", {})
+                set_current_report(full["report"])
+                st.session_state["_loaded_msg"] = f"'{d['name']}' 보고서를 불러왔습니다. [보고서 생성] 탭 아래에서 확인하세요."
+                st.rerun()
+        full_json = load_draft(d["id"])
+        if full_json:
+            payload = {"name": full_json["name"], "report": public_report(full_json["report"])}
+            c3.download_button("JSON 저장", json.dumps(payload, ensure_ascii=False), f"wivo_draft_{d['id']}.json",
+                               "application/json", key=f"dj_{d['id']}", use_container_width=True)
+        if c4.button("삭제", key=f"rm_{d['id']}", use_container_width=True):
+            delete_draft(d["id"])
+            st.rerun()
+
+    st.divider()
+    st.subheader("기사 선별 · 합치기 (중복 제거)")
+    st.caption("같은 날짜의 임시 저장 보고서를 골라 기사를 한 표에서 확인하고, 중복·불필요 기사를 체크 해제한 뒤 새 보고서로 구성합니다.")
+    ids = st.multiselect("대상 임시 보고서", [d["id"] for d in drafts],
+                         format_func=lambda i: draft_label(next(x for x in drafts if x["id"] == i)))
+    if not ids:
+        return
+    fulls = [load_draft(i) for i in ids]
+    reps = [f["report"] for f in fulls if f]
+    if len({r["target_date"] for r in reps}) > 1:
+        st.error("같은 날짜의 보고서만 합칠 수 있습니다.")
+        return
+    pool: list[dict] = []
+    seen: list[tuple[str, str, int]] = []  # (norm_title, norm_url, 행 번호)
+    for f in fulls:
+        for c in f["report"]["categories"]:
+            for a in c["articles"]:
+                nt, nu = norm_title(a["title"]), norm_url(a["url"])
+                dup = ""
+                for t2, u2, idx in seen:
+                    if nu == u2 or difflib.SequenceMatcher(None, nt, t2).ratio() >= 0.6:
+                        dup = f"#{idx}와 유사"
+                        break
+                idx = len(pool) + 1
+                seen.append((nt, nu, idx))
+                pool.append({"cat": c["name"], "art": a, "dup": dup, "src": f["name"], "idx": idx})
+    import pandas as pd
+    df = pd.DataFrame([{"선택": not p["dup"], "No": p["idx"], "분야": p["cat"], "제목": p["art"]["title"],
+                        "언론사": p["art"]["outlet"], "기자": p["art"]["reporter"],
+                        "발행": p["art"]["published"][5:], "중복 의심": p["dup"], "출처 보고서": p["src"]} for p in pool])
+    edited = st.data_editor(
+        df, key="sel_" + "_".join(ids), hide_index=True, use_container_width=True,
+        disabled=[c for c in df.columns if c != "선택"],
+        column_config={"선택": st.column_config.CheckboxColumn("선택", help="체크된 기사만 새 보고서에 들어갑니다.")})
+    chosen_idx = set(edited.loc[edited["선택"], "No"].tolist())
+    st.write(f"선택된 기사 **{len(chosen_idx)}건** / 전체 {len(pool)}건 (중복 의심 {sum(1 for p in pool if p['dup'])}건은 기본 해제)")
+    if st.button("선택한 기사로 새 보고서 구성", type="primary", disabled=not chosen_idx):
+        if not api_key:
+            st.error("Gemini API 키가 필요합니다. (분야별 브리핑을 다시 작성합니다)")
+            return
+        selected: dict[str, list[dict]] = {}
+        for p in pool:
+            if p["idx"] in chosen_idx:
+                selected.setdefault(p["cat"], []).append(p["art"])
+        with st.status("새 보고서 구성 중…", expanded=True) as status:
+            try:
+                runner = GeminiRunner(api_key, main_model.strip() or DEFAULT_MAIN_MODEL,
+                                      light_model.strip() or DEFAULT_LIGHT_MODEL)
+                new = compose_report(selected, reps, runner, lambda m: status.write(m))
+                save_draft(new, f"합본 {new['target_date']} ({new['total_articles']}건)")
+                set_current_report(new)
+                status.update(label="완료", state="complete")
+                st.session_state["_loaded_msg"] = "새 보고서를 구성했습니다. [보고서 생성] 탭 아래에서 확인하세요."
+            except Exception as e:
+                status.update(label="실패", state="error")
+                st.error(f"구성 중 오류: {e}")
+                return
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8) Streamlit UI
 # ──────────────────────────────────────────────────────────────────────────────
 def license_gate() -> None:
     keys = secret("LICENSE_KEYS")
@@ -1622,6 +1994,7 @@ def license_gate() -> None:
     if ok:
         if any(hmac.compare_digest(entered.encode(), str(k).encode()) for k in keys):
             st.session_state["licensed"] = True
+            st.session_state["license_key"] = entered
             st.rerun()
         else:
             st.error("유효하지 않은 키입니다.")
@@ -1639,43 +2012,14 @@ def parse_custom(text: str) -> list[Category]:
     return out
 
 
-def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, page_icon="📰", layout="wide")
-    st.markdown("""
-<style>
-.block-container{padding-top:1.6rem;max-width:1200px}
-h1,h2,h3{color:#0b2334}
-div[data-testid="stSidebar"]{background:#f4f7fa}
-</style>""", unsafe_allow_html=True)
-    license_gate()
+def split_csv(text: str) -> list[str]:
+    return [x.strip() for x in re.split(r"[,\n]", text or "") if x.strip()]
 
-    st.image(base64.b64decode(LOGO_B64_EMBED), width=190)
-    st.title(APP_TITLE)
-    st.caption("지정일 · 분야별 뉴스를 원문 검증 후 HTML A4 보고서로 생성합니다. (인쇄 / 블로그 업로드용)")
 
-    # ── 사이드바
-    with st.sidebar:
-        st.subheader("API 설정")
-        api_key = secret("GEMINI_API_KEY", "")
-        if api_key:
-            st.success("Gemini API 키: 서버 설정 사용")
-        else:
-            api_key = st.text_input("Gemini API 키", type="password")
-        main_model = st.text_input("메인 모델 (브리핑)", DEFAULT_MAIN_MODEL)
-        light_model = st.text_input("경량 모델 (기사 요약)", DEFAULT_LIGHT_MODEL)
-        st.caption("모델 ID가 유효하지 않으면 자동으로 다음 모델로 폴백합니다.")
-        st.subheader("기사 소스")
-        srcs = st.multiselect("검색 소스", ["Google News", "Naver 검색 API"], default=["Google News"])
-        naver_id = secret("NAVER_CLIENT_ID", "")
-        naver_secret = secret("NAVER_CLIENT_SECRET", "")
-        if "Naver 검색 API" in srcs and not (naver_id and naver_secret):
-            naver_id = st.text_input("Naver Client ID")
-            naver_secret = st.text_input("Naver Client Secret", type="password")
-        if "Naver 검색 API" in srcs:
-            st.caption("Naver 검색 API는 최신순만 지원하여, 며칠 지난 날짜는 Google News 중심으로 수집됩니다.")
-
-    # ── 본문 입력
+def generate_tab(api_key: str, main_model: str, light_model: str, srcs: list[str],
+                 naver_id: str, naver_secret: str) -> None:
     today = datetime.now(KST).date()
+    drafts = list_drafts()
     c1, c2 = st.columns([1, 2])
     with c1:
         target = st.date_input("조사 기준일", value=today - timedelta(days=1), max_value=today)
@@ -1686,21 +2030,59 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
         custom = st.text_area("직접 추가 분야 (한 줄에 `분야명: 키워드1, 키워드2`)",
                               placeholder="치과: 임플란트, 치과의사협회\n건설: 부동산 PF, 건설사", height=80)
         exclude = st.text_input("제외할 매체/도메인 (쉼표 구분)", placeholder="예: 위키트리, blog.")
+
+    with st.expander("🔎 키워드 설정 (지역 · 기사 내 문구)", expanded=True):
+        k1, k2 = st.columns(2)
+        with k1:
+            reg_pick = st.multiselect("지역 설정", [r for r in REGIONS if r != "전국"],
+                                      help="선택한 지역이 기사 제목·본문에 나오는 기사만 수록합니다. 비워두면 전국.")
+            reg_custom = st.text_input("직접 추가 지역 (쉼표 구분)", placeholder="예: 수성구, 달서구, 포항")
+        with k2:
+            ph_pick = st.multiselect("기사 내 문구 검색", PHRASE_PRESETS,
+                                     help="선택한 문구가 기사 제목·본문에 들어 있는 기사만 수록합니다. 비워두면 제한 없음.")
+            ph_custom = st.text_input("직접 추가 문구 (쉼표 구분)", placeholder="예: 임플란트, 도수치료, 비급여")
+        k3, k4 = st.columns(2)
+        with k3:
+            ph_mode = st.radio("문구 포함 방식", ["하나라도 포함 (OR)", "모두 포함 (AND)"], horizontal=True)
+        with k4:
+            ex_phrases = st.text_input("제외 문구 (쉼표 구분)", placeholder="예: 광고, 이벤트")
+        st.caption("지역·문구는 선택한 모든 분야에 적용되며, 검색 단계와 원문 검증 단계에서 모두 확인합니다.")
+
+    with st.expander("♻️ 중복 방지 · 임시 저장", expanded=bool(drafts)):
+        skip_ids = st.multiselect("임시 저장된 보고서에 있는 기사는 제외하고 생성", [d["id"] for d in drafts],
+                                  format_func=lambda i: draft_label(next(x for x in drafts if x["id"] == i)),
+                                  help="이미 수록한 기사와 같은 기사(주소·제목 유사)는 후보에서 뺍니다.")
+        autosave = st.checkbox("생성 후 자동으로 임시 저장", value=True)
     if target == today:
         st.info("오늘 날짜는 하루가 끝나기 전이라 기사가 일부만 포함될 수 있습니다.")
+
+    msg = st.session_state.pop("_loaded_msg", None)
+    if msg:
+        st.success(msg)
 
     run = st.button("보고서 생성", type="primary", use_container_width=True)
     if run:
         cats = [Category(n, PRESETS[n]) for n in picked] + parse_custom(custom)
         if not cats:
             st.error("분야를 1개 이상 선택하세요.")
-            st.stop()
+            return
         if not api_key:
             st.error("Gemini API 키가 필요합니다.")
-            st.stop()
+            return
         if not srcs:
             st.error("검색 소스를 1개 이상 선택하세요.")
-            st.stop()
+            return
+        regions = [REGIONS[r] for r in reg_pick] + [[x] for x in split_csv(reg_custom)]
+        phrases = list(dict.fromkeys(ph_pick + split_csv(ph_custom)))
+        skip_titles: list[str] = []
+        skip_urls: set[str] = set()
+        for i in skip_ids:
+            f = load_draft(i)
+            if f:
+                for c in f["report"]["categories"]:
+                    for a in c["articles"]:
+                        skip_titles.append(norm_title(a["title"]))
+                        skip_urls.add(norm_url(a["url"]))
         cfg = Config(
             target=target, categories=cats, per_cat=per_cat, strict_reporter=strict,
             sources=[k for label, k in (("Google News", "google"), ("Naver 검색 API", "naver")) if label in srcs],
@@ -1708,21 +2090,20 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
             main_model=main_model.strip() or DEFAULT_MAIN_MODEL,
             light_model=light_model.strip() or DEFAULT_LIGHT_MODEL,
             api_key=api_key, naver_id=naver_id, naver_secret=naver_secret,
+            oversample=5 if (regions or phrases or skip_titles) else 3,
+            regions=regions, phrases=phrases, phrase_mode="and" if "AND" in ph_mode else "or",
+            ex_phrases=split_csv(ex_phrases), skip_titles=skip_titles, skip_urls=skip_urls,
         )
         bar = st.progress(0.0)
         with st.status("보고서 생성 중…", expanded=True) as status:
             try:
                 rep = build_report(cfg, lambda m: status.write(m), lambda p: bar.progress(min(max(p, 0.0), 1.0)))
                 bar.progress(1.0)
-                st.session_state["report"] = rep
-                st.session_state["html_print"] = render_report(rep, "print")
-                st.session_state["html_blog"] = render_report(rep, "blog")
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for c in rep["categories"]:
-                        for a in c["articles"]:
-                            zf.writestr(f"article_{a['no']:02d}.html", render_report(rep, "print", only_no=a["no"]))
-                st.session_state["zip_articles"] = buf.getvalue()
+                set_current_report(rep)
+                if autosave:
+                    flt = filter_text(rep)
+                    save_draft(rep, f"{rep['target_date']} {'·'.join(c['name'] for c in rep['categories'])}"
+                                    + (f" ({flt})" if flt else ""))
                 status.update(label=f"완료 — 총 {rep['total_articles']}건 수록", state="complete", expanded=False)
             except Exception as e:
                 status.update(label="실패", state="error")
@@ -1734,7 +2115,12 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
 
     fname = f"wivo_news_report_{rep['target_date']}"
     st.divider()
-    st.subheader(f"{rep['target_date']} 보고서 — 총 {rep['total_articles']}건")
+    h1, h2 = st.columns([3, 1])
+    h1.subheader(f"{rep['target_date']} 보고서 — 총 {rep['total_articles']}건")
+    if h2.button("💾 임시 저장", use_container_width=True, help="현재 보고서를 임시 저장함에 보관합니다."):
+        flt = filter_text(rep)
+        save_draft(rep, f"{rep['target_date']} {'·'.join(c['name'] for c in rep['categories'])}" + (f" ({flt})" if flt else ""))
+        st.toast("임시 저장함에 보관했습니다.")
     d1, d2, d3, d4 = st.columns(4)
     d1.download_button("전체 A4 HTML", st.session_state["html_print"], f"{fname}_a4.html",
                        "text/html", use_container_width=True, type="primary")
@@ -1742,7 +2128,7 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
                        "application/zip", use_container_width=True, disabled=not rep["total_articles"])
     d3.download_button("블로그용 HTML(전체)", st.session_state["html_blog"], f"{fname}_blog.html",
                        "text/html", use_container_width=True)
-    d4.download_button("원본 데이터(JSON)", json.dumps({k: v for k, v in rep.items() if k != "models"}, ensure_ascii=False, indent=2), f"{fname}.json",
+    d4.download_button("원본 데이터(JSON)", json.dumps(public_report(rep), ensure_ascii=False, indent=2), f"{fname}.json",
                        "application/json", use_container_width=True)
 
     st.info("📷 **JPG 저장**: 'A4 미리보기' 탭 우측 하단의 [JPG 저장](전체) 또는 [기사 페이지만 JPG] 버튼을 누르면 "
@@ -1770,6 +2156,47 @@ div[data-testid="stSidebar"]{background:#f4f7fa}
         st.markdown(f"**제외된 기사 {len(rep['rejected'])}건**")
         st.dataframe([{"분야": r["category"], "제목": r["title"], "언론사": r["outlet"], "사유": r["reason"],
                        "URL": r["url"]} for r in rep["rejected"]], hide_index=True, use_container_width=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title=APP_TITLE, page_icon="📰", layout="wide")
+    st.markdown("""
+<style>
+.block-container{padding-top:1.6rem;max-width:1200px}
+h1,h2,h3{color:#0b2334}
+div[data-testid="stSidebar"]{background:#f4f7fa}
+</style>""", unsafe_allow_html=True)
+    license_gate()
+
+    st.image(base64.b64decode(LOGO_B64_EMBED), width=190)
+    st.title(APP_TITLE)
+    st.caption("지정일 · 분야별 뉴스를 원문 검증 후 HTML A4 보고서로 생성합니다. (인쇄 / 블로그 업로드용)")
+
+    with st.sidebar:
+        st.subheader("API 설정")
+        api_key = secret("GEMINI_API_KEY", "")
+        if api_key:
+            st.success("Gemini API 키: 서버 설정 사용")
+        else:
+            api_key = st.text_input("Gemini API 키", type="password")
+        main_model = st.text_input("메인 모델 (브리핑)", DEFAULT_MAIN_MODEL)
+        light_model = st.text_input("경량 모델 (기사 요약)", DEFAULT_LIGHT_MODEL)
+        st.caption("모델 ID가 유효하지 않으면 자동으로 다음 모델로 폴백합니다.")
+        st.subheader("기사 소스")
+        srcs = st.multiselect("검색 소스", ["Google News", "Naver 검색 API"], default=["Google News"])
+        naver_id = secret("NAVER_CLIENT_ID", "")
+        naver_secret = secret("NAVER_CLIENT_SECRET", "")
+        if "Naver 검색 API" in srcs and not (naver_id and naver_secret):
+            naver_id = st.text_input("Naver Client ID")
+            naver_secret = st.text_input("Naver Client Secret", type="password")
+        if "Naver 검색 API" in srcs:
+            st.caption("Naver 검색 API는 최신순만 지원하여, 며칠 지난 날짜는 Google News 중심으로 수집됩니다.")
+
+    tab_gen, tab_drafts = st.tabs(["① 보고서 생성", "② 임시 저장함 · 기사 선별"])
+    with tab_gen:
+        generate_tab(api_key, main_model, light_model, srcs, naver_id, naver_secret)
+    with tab_drafts:
+        drafts_tab(api_key, main_model, light_model)
 
 
 if __name__ == "__main__":
